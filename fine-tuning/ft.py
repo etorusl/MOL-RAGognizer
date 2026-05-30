@@ -422,6 +422,13 @@ else:
     val_dataset   = split_dataset["test"]
     test_dataset  = formatted_dataset(dataset["test"])
 
+if len(train_dataset) == 0:
+    model_short = MODEL_NAME.split("/", 1)[1]
+    raise ValueError(
+        f"Empty dataset! Model '{model_short}' has no responses in the dataset. "
+        f"Use --allentries to train on all available responses, or switch to a model that exists in the dataset."
+    )
+
 train_dataset.set_format(
     type="torch",
     columns=["input_ids", "attention_mask", head_name, "labels"],
@@ -436,9 +443,9 @@ test_dataset.set_format(
 )
 
 # Calculcate weight for hallucinated tokens (to account for imbalance)
+zeros = 0
+ones = 0
 if BALANCED:
-    zeros = 0
-    ones = 0
     for ten in train_dataset[head_name]:
         zeros += (ten == 0).sum().item()
         ones += (ten == 1).sum().item()
