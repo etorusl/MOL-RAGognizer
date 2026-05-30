@@ -67,7 +67,10 @@ class LayerAggregator(nn.Module):
             weights = torch.softmax(self.raw_weights, dim=0)
         else:
             weights = torch.sigmoid(self.raw_weights)
-        weights = weights.view(1, -1, 1).to(hidden_states.device)
+        if hidden_states.dim() == 4:
+            weights = weights.view(1, -1, 1, 1).to(hidden_states.device)
+        else:
+            weights = weights.view(1, -1, 1).to(hidden_states.device)
         return (hidden_states * weights).sum(dim=1)
 
 
