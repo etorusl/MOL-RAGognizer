@@ -14,9 +14,6 @@ from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, GenerationConfig
 from peft import PeftModel
 import json
-from transformer_heads import load_lora_with_heads
-from transformer_heads.util.helpers import get_model_params
-from transformer_heads.constants import model_type_map as TRANSFORMER_HEADS_ARCH_MAP
 
 
 class PostProcessor(torch.nn.Module):
@@ -138,6 +135,10 @@ class RAGognizer(HallucinationDetector):
         self.tokenizer = AutoTokenizer.from_pretrained(adapter_config["base_model_name_or_path"], device_map=device)
 
         if self.use_transformer_heads:
+            from transformer_heads import load_lora_with_heads
+            from transformer_heads.util.helpers import get_model_params
+            from transformer_heads.constants import model_type_map as TRANSFORMER_HEADS_ARCH_MAP
+
             # Get base model class
             cfg = AutoConfig.from_pretrained(adapter_config["base_model_name_or_path"]).to_dict()
             arch = cfg["architectures"][0]
