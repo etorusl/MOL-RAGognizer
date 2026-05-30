@@ -59,6 +59,21 @@ class MLP(nn.Module):
         return self.network(x.float())
 
 
+class LayerAggregator(nn.Module):
+    def __init__(self, num_layers: int, use_softmax: bool = True):
+        super().__init__()
+        self.raw_weights = nn.Parameter(torch.zeros(num_layers))
+        self.use_softmax = use_softmax
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.use_softmax:
+            weights = torch.softmax(self.raw_weights, dim=0)
+        else:
+            weights = torch.sigmoid(self.raw_weights)
+        weights = weights.view(1, -1, 1).to(hidden_states.device)
+        return (hidden_states * weights).sum(dim=1)
+
+
 class RAGognizer(HallucinationDetector):
     def __init__(
         self,
@@ -106,6 +121,8 @@ class RAGognizer(HallucinationDetector):
         if checkpoint_dir is None:
             repo_dir = snapshot_download(ragognizer_repo_name, repo_type="model")
             checkpoint_dir = os.path.join(repo_dir, "ft_llm")
+        else:
+            repo_dir = checkpoint_dir
 
         with open(os.path.join(checkpoint_dir, "adapter_config.json"), "r") as file:
             adapter_config = json.load(file)
@@ -200,8 +217,14 @@ class RAGognizer(HallucinationDetector):
             self.mlp = MLP(**mlp_cfg)
             self.mlp.load_state_dict(torch.load(weights_path))
             self.mlp.to(device).eval()
-            
-            self.layer_perc = other_data["layer_perc"]
+
+            num_layers = self.llm.config.num_hidden_layers + 1
+            layer_weights_path = os.path.join(repo_dir, "mlp_layer_weights.pt")
+
+            self.layer_aggregator = LayerAggregator(num_layers)
+            self.layer_aggregator.load_state_dict(torch.load(layer_weights_path, map_location=device))
+            self.layer_aggregator.to(device).eval()
+
             self.binarization_threshold = other_data["binarization_threshold"]
             self.postprocessor_kernel_size = other_data.get("postprocessor_kernel_size", None)
 
@@ -389,10 +412,9 @@ class RAGognizer(HallucinationDetector):
         else:
             cevs = self.get_internal_states(chat, next(self.mlp.parameters()).device)
 
-            layer_i = int((cevs.shape[1] - 1) * self.layer_perc) + 1
-            states = cevs[:, layer_i, :]
+            aggregated = self.layer_aggregator(cevs)
 
-            logits = self.mlp(states)
+            logits = self.mlp(aggregated)
             probs = torch.sigmoid(logits).detach().cpu().flatten()
 
         if self.postprocessor is not None:
@@ -438,8 +460,8 @@ class RAGognizer(HallucinationDetector):
         del model_inputs, input_ids, probs
         if 'cevs' in locals():
             del cevs
-        if 'states' in locals():
-            del states
+        if 'aggregated' in locals():
+            del aggregated
         if 'logits' in locals():
             del logits
 
@@ -573,12 +595,14 @@ class RAGognizer(HallucinationDetector):
                 if next_token_id == self.tokenizer.eos_token_id:
                     break
                 
-                # Extract the hidden state for the generated token
-                layer_i = int((len(outputs.hidden_states) - 1) * self.layer_perc) + 1
-                hidden_states = outputs.hidden_states[layer_i]
-                last_token_hidden_state = hidden_states[:, -1, :]
+                # Extract hidden states for the generated token from all layers
+                last_token_hidden_states = torch.stack(
+                    [hs[:, -1, :] for hs in outputs.hidden_states], dim=0
+                )  # (num_layers, 1, hidden_size)
+                last_token_hidden_states = last_token_hidden_states.transpose(0, 1)  # (1, num_layers, hidden_size)
 
-                logits = self.mlp(last_token_hidden_state.to(self.device))
+                aggregated = self.layer_aggregator(last_token_hidden_states.to(self.device))
+                logits = self.mlp(aggregated)
                 prob = torch.sigmoid(logits).detach().cpu().flatten().item()
 
             all_raw_probs.append(prob)
