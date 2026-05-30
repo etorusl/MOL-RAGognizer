@@ -20,24 +20,16 @@ load_dotenv(find_dotenv()) # might require "HF_TOKEN" to be set in the .env file
 
 from ragognizer.benchmarks.RAGTruth import RAGTruth
 from datasets import load_dataset, Dataset, load_from_disk
-from transformers import AutoTokenizer, BitsAndBytesConfig, Lfm2Model, Qwen3Model, GraniteMoeHybridModel, Gemma3TextModel
+from transformers import AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig
 from argparse import ArgumentParser
 import matplotlib.pyplot as plt
 from trl import SFTTrainer, SFTConfig
 
-from transformer_heads.util.helpers import DataCollatorWithPadding, get_model_params
-from transformer_heads import create_headed_qlora
-from transformer_heads.config import HeadConfig
-from transformer_heads.util.model import print_trainable_parameters
-from transformer_heads.output import HeadedModelOutput
-from transformer_heads.constants import model_type_map
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from sklearn.metrics import average_precision_score, roc_curve, roc_auc_score
-
-from transformer_heads.constants import loss_fct_map
 
 parser = ArgumentParser()
 parser.add_argument("model")
@@ -79,26 +71,13 @@ PAD_TOKEN = {
     "meta-llama/Llama-3.2-1B-Instruct": "<|reserved_special_token_0|>",
 }.get(MODEL_NAME, None)
 
-model_params = get_model_params(MODEL_NAME)
-model_class = model_params["model_class"]
-hidden_size = model_params["hidden_size"]
-vocab_size = model_params["vocab_size"]
-
-head_perc = 0.5
-layer_hook = int(model_params["num_hidden_layers"] * head_perc)
-if HEAD_AT_END:
-    layer_hook = 1 # Last layer
-head_name = f"hallu_head_neg_{layer_hook}"
+hidden_size = None  # set later: MLP mode from model config, transformer-heads mode from get_model_params
+head_name = "hallu_labels"
 
 CURR_DIR = os.path.dirname(os.path.realpath(__file__))
 DATA_DIR = os.path.join(CURR_DIR, "..", "ragognize", "data")
 OUTPUT_DIR = os.path.join(CURR_DIR, OUTNAME, MODEL_NAME.split("/")[-1])
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-model_type_map["qwen3"] = ("model", Qwen3Model)
-model_type_map["lfm2"] = ("model", Lfm2Model)
-model_type_map["granitemoehybrid"] = ("model", GraniteMoeHybridModel)
-model_type_map["gemma3_text"] = ("model", Gemma3TextModel)
 
 # if PAD_TOKEN is None:
 #     raise Exception("Padding token is None! Please, set add an appropiate pad_token.")
@@ -513,6 +492,7 @@ if USE_MLP:
             llm_model.resize_token_embeddings(len(tokenizer))
 
     num_layers = llm_model.config.num_hidden_layers + 1
+    hidden_size = llm_model.config.hidden_size
     layer_aggregator = LayerAggregator(num_layers).to("cuda")
     mlp = MLP(input_size=hidden_size, hidden_dims=MLP_HIDDEN_DIMS).to("cuda")
 
@@ -549,6 +529,7 @@ if USE_MLP:
 
     GRAD_ACCUM = 8
     SCALE_FACTOR = GRAD_ACCUM
+    pos_weight_tensor = torch.tensor([ones_weight]).to("cuda") if BALANCED else None
 
     def eval_mlp(is_val=True):
         llm_model.eval()
@@ -584,7 +565,8 @@ if USE_MLP:
                 mask = hallu_labels >= -0.1
                 if mask.any():
                     hallu_loss = F.binary_cross_entropy_with_logits(
-                        hallu_logits[mask], hallu_labels[mask]
+                        hallu_logits[mask], hallu_labels[mask],
+                        pos_weight=pos_weight_tensor,
                     )
                 else:
                     hallu_loss = torch.tensor(0.0, device="cuda")
@@ -743,6 +725,29 @@ if USE_MLP:
 
     import sys
     sys.exit(0)
+
+from transformer_heads.util.helpers import DataCollatorWithPadding, get_model_params
+from transformer_heads import create_headed_qlora
+from transformer_heads.config import HeadConfig
+from transformer_heads.util.model import print_trainable_parameters
+from transformer_heads.output import HeadedModelOutput
+from transformer_heads.constants import model_type_map, loss_fct_map
+from transformers import Lfm2Model, Qwen3Model, GraniteMoeHybridModel, Gemma3TextModel
+
+model_type_map["qwen3"] = ("model", Qwen3Model)
+model_type_map["lfm2"] = ("model", Lfm2Model)
+model_type_map["granitemoehybrid"] = ("model", GraniteMoeHybridModel)
+model_type_map["gemma3_text"] = ("model", Gemma3TextModel)
+
+model_params = get_model_params(MODEL_NAME)
+model_class = model_params["model_class"]
+hidden_size = model_params["hidden_size"]
+vocab_size = model_params["vocab_size"]
+
+head_perc = 0.5
+layer_hook = int(model_params["num_hidden_layers"] * head_perc)
+if HEAD_AT_END:
+    layer_hook = 1
 
 class Masked_BCEWithLogitsLoss(torch.nn.BCEWithLogitsLoss):
     def forward(self, input: torch.Tensor, target: torch.Tensor):
