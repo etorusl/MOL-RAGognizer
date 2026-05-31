@@ -644,7 +644,8 @@ if USE_MLP:
             mask = hallu_labels >= -0.1
             if mask.any():
                 hallu_loss = F.binary_cross_entropy_with_logits(
-                    hallu_logits[mask], hallu_labels[mask]
+                    hallu_logits[mask], hallu_labels[mask],
+                    pos_weight=pos_weight_tensor,
                 )
             else:
                 hallu_loss = torch.tensor(0.0, device="cuda")
