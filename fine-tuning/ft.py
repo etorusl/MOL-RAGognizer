@@ -517,7 +517,10 @@ if USE_MLP:
     def _extract_entry(item, key, dtype):
         val = item[key]
         if isinstance(val, torch.Tensor):
-            return val.to(dtype=dtype)
+            t = val.to(dtype=dtype)
+            if t.dim() == 2 and t.size(0) == 1:
+                t = t.squeeze(0)
+            return t
         if isinstance(val, dict):
             val = list(val.values())[0] if len(val) == 1 else list(val.values())
         if isinstance(val, np.ndarray):
