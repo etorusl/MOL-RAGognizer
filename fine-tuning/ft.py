@@ -518,14 +518,14 @@ if USE_MLP:
         val = item[key]
         if isinstance(val, torch.Tensor):
             t = val.to(dtype=dtype)
-            if t.dim() == 2 and t.size(0) == 1:
-                t = t.squeeze(0)
-            return t
-        if isinstance(val, dict):
+        elif isinstance(val, dict):
             val = list(val.values())[0] if len(val) == 1 else list(val.values())
-        if isinstance(val, np.ndarray):
-            return torch.from_numpy(val).to(dtype=dtype)
-        return torch.tensor(list(val), dtype=dtype)
+            t = torch.tensor(val, dtype=dtype)
+        elif isinstance(val, np.ndarray):
+            t = torch.from_numpy(val).to(dtype=dtype)
+        else:
+            t = torch.tensor(list(val), dtype=dtype)
+        return t.view(-1)
 
     def _dataset_to_tensors(ds):
         entries = []
