@@ -92,7 +92,7 @@ try:
 except Exception:
     print(f"Warning: AutoProcessor failed (missing torchvision?), using AutoTokenizer only")
 
-def _apply_chat_template(messages, tokenize=True, add_generation_prompt=False):
+def _apply_chat_template(messages, tokenize=True, add_generation_prompt=False, **kwargs):
     if _processor is not None:
         try:
             return _processor.apply_chat_template(messages, tokenize=tokenize,
