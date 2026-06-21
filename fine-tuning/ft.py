@@ -760,16 +760,19 @@ if USE_MLP:
         os.makedirs(save_dir, exist_ok=True)
         print("Saving to", save_dir)
 
-        llm_model.save_pretrained(save_dir)
-        torch.save(mlp.state_dict(), os.path.join(save_dir, "mlp_state.pt"))
-        torch.save(layer_aggregator.state_dict(), os.path.join(save_dir, "mlp_layer_weights.pt"))
-        with open(os.path.join(save_dir, "mlp_config.json"), "w") as f:
-            json.dump(mlp.config, f, ensure_ascii=False, indent=4)
-        with open(os.path.join(save_dir, "mlp_other_data.json"), "w") as f:
-            json.dump({
-                "original_repo_id": MODEL_NAME,
-                "binarization_threshold": eval_res["best_threshold"],
-            }, f, ensure_ascii=False, indent=4)
+        try:
+            llm_model.save_pretrained(save_dir)
+            torch.save(mlp.state_dict(), os.path.join(save_dir, "mlp_state.pt"))
+            torch.save(layer_aggregator.state_dict(), os.path.join(save_dir, "mlp_layer_weights.pt"))
+            with open(os.path.join(save_dir, "mlp_config.json"), "w") as f:
+                json.dump(mlp.config, f, ensure_ascii=False, indent=4)
+            with open(os.path.join(save_dir, "mlp_other_data.json"), "w") as f:
+                json.dump({
+                    "original_repo_id": MODEL_NAME,
+                    "binarization_threshold": eval_res["best_threshold"],
+                }, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            print(f"WARNING: Failed to save checkpoint: {e}")
 
     test_res = eval_mlp(is_val=False)
     print("test:", test_res)
@@ -1063,7 +1066,10 @@ for epoch in range(EPOCHS):
     save_dir = os.path.join(OUTPUT_DIR, f"checkpoint_{epoch+1}")
     print("Saving to", save_dir)
 
-    model.save_pretrained(save_dir)
+    try:
+        model.save_pretrained(save_dir)
+    except Exception as e:
+        print(f"WARNING: Failed to save checkpoint: {e}")
 
 test_res = eval(is_val=False)
 print("test:", test_res)
