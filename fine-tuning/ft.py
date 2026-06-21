@@ -532,14 +532,38 @@ if USE_MLP:
         entries = []
         for i in range(len(ds)):
             item = ds[i]
-            entries.append((
-                _extract_entry(item, "input_ids", torch.long),
-                _extract_entry(item, "attention_mask", torch.long),
-                _extract_entry(item, "labels", torch.long),
-                torch.tensor([v if isinstance(v, (int, float)) else v[0]
-                              for v in (item[head_name].tolist() if isinstance(item[head_name], torch.Tensor)
-                                        else item[head_name])], dtype=torch.float32),
-            ))
+            ids = _extract_entry(item, "input_ids", torch.long)
+            L = ids.size(0)
+            am = torch.ones(L, dtype=torch.long)
+            try:
+                lbl = _extract_entry(item, "labels", torch.long)
+                if lbl.size(0) < L:
+                    lbl = torch.cat([lbl, torch.full((L - lbl.size(0),), -100, dtype=torch.long)])
+                elif lbl.size(0) > L:
+                    lbl = lbl[:L]
+            except Exception:
+                lbl = ids.clone()
+            hl_raw = item[head_name]
+            if isinstance(hl_raw, torch.Tensor):
+                hl_raw = hl_raw.flatten().tolist()
+            elif isinstance(hl_raw, dict):
+                hl_raw = list(hl_raw.values())
+                if len(hl_raw) == 1:
+                    hl_raw = list(hl_raw[0]) if hasattr(hl_raw[0], '__iter__') else [hl_raw[0]]
+            hl_vals = []
+            for v in hl_raw:
+                if isinstance(v, (int, float)):
+                    hl_vals.append(v)
+                elif hasattr(v, '__iter__') and not isinstance(v, str):
+                    hl_vals.append(list(v)[0] if len(list(v)) > 0 else -1.0)
+                else:
+                    hl_vals.append(-1.0)
+            hl = torch.tensor(hl_vals, dtype=torch.float32)
+            if hl.size(0) < L:
+                hl = torch.cat([hl, torch.full((L - hl.size(0),), -1.0)])
+            elif hl.size(0) > L:
+                hl = hl[:L]
+            entries.append((ids, am, lbl, hl))
         return entries
 
     train_tensors = _dataset_to_tensors(train_dataset)
