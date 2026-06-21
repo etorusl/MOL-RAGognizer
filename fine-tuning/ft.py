@@ -83,6 +83,10 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 #     raise Exception("Padding token is None! Please, set add an appropiate pad_token.")
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+from transformers import AutoProcessor
+_processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True)
+if hasattr(_processor, 'tokenizer'):
+    tokenizer = _processor.tokenizer
 
 # print(tokenizer.pad_token_id)
 # print(tokenizer.convert_ids_to_tokens([0])[0])
@@ -176,11 +180,11 @@ def formatted_dataset(dataset, max_length=None):
                         "content": entry["responses"][curr_model]["text"]
                     }
                 ]
-                entry_tok = { "input_ids": tokenizer.apply_chat_template(prompt, tokenize=True) }
+                entry_tok = { "input_ids": _processor.apply_chat_template(prompt, tokenize=True, enable_thinking=False) }
                 entry_tok["attention_mask"] = np.ones(shape=(len(entry_tok["input_ids"]),), dtype=np.int32).tolist()
 
                 entry_tok["labels"] = list(entry_tok["input_ids"])
-                user_tokens = tokenizer.apply_chat_template(entry["rag_prompt"], tokenize=True, add_generation_prompt=True)
+                user_tokens = _processor.apply_chat_template(entry["rag_prompt"], tokenize=True, add_generation_prompt=True, enable_thinking=False)
                 assistant_token_start = len(user_tokens)
 
                 token_starts = []
@@ -262,7 +266,12 @@ def formatted_dataset(dataset, max_length=None):
                 #     input()
 
     # Create new dataset
-    return Dataset.from_list(entries)
+    ds = Dataset.from_list(entries)
+    if len(entries) > 0:
+        e0 = entries[0]
+        hp = np.array([h[0] for h in e0[head_name]])
+        print(f"DEBUG formatted_dataset: {len(entries)} entries, ids={len(e0['input_ids'])} hallu_nonneg={int((hp >= 0).sum())} hallu_ones={int((hp == 1).sum())}")
+    return ds
 
 def formatted_ragtruth(get_test: bool=False, eval_perc: float=None):
     train_entries = []
@@ -305,11 +314,11 @@ def formatted_ragtruth(get_test: bool=False, eval_perc: float=None):
             prompt = entry["chat"]
             user_prompt = [msg for msg in prompt if msg["role"] != "assistant"]
 
-            entry_tok = { "input_ids": tokenizer.apply_chat_template(prompt, tokenize=True) }
+            entry_tok = { "input_ids": _processor.apply_chat_template(prompt, tokenize=True, enable_thinking=False) }
             entry_tok["attention_mask"] = np.ones(shape=(len(entry_tok["input_ids"]),), dtype=np.int32).tolist()
 
             entry_tok["labels"] = list(entry_tok["input_ids"])
-            user_tokens = tokenizer.apply_chat_template(user_prompt, tokenize=True, add_generation_prompt=True)
+            user_tokens = _processor.apply_chat_template(user_prompt, tokenize=True, add_generation_prompt=True, enable_thinking=False)
             assistant_token_start = len(user_tokens)
 
 
