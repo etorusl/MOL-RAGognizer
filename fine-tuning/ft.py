@@ -94,14 +94,11 @@ except Exception as e:
     print(f"Warning: AutoProcessor failed ({e}), using AutoTokenizer only")
 
 def _apply_chat_template(messages, tokenize=True, add_generation_prompt=False, **kwargs):
-    if _processor is not None:
-        try:
-            return _processor.apply_chat_template(messages, tokenize=tokenize,
-                add_generation_prompt=add_generation_prompt, enable_thinking=False)
-        except Exception:
-            pass
-    return tokenizer.apply_chat_template(messages, tokenize=tokenize,
-        add_generation_prompt=add_generation_prompt)
+    result = tokenizer.apply_chat_template(messages, tokenize=tokenize,
+        add_generation_prompt=add_generation_prompt, **kwargs)
+    if isinstance(result, dict):
+        result = result["input_ids"]
+    return result
 
 # print(tokenizer.pad_token_id)
 # print(tokenizer.convert_ids_to_tokens([0])[0])
