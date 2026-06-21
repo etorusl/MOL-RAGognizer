@@ -514,41 +514,52 @@ if USE_MLP:
         {"params": mlp.parameters(), "lr": 4e-5},
     ])
 
-    def collate_mlp(batch):
-        max_len = max(len(item["input_ids"]) for item in batch)
-        padded = {}
-        for key in ["input_ids", "attention_mask", "labels"]:
-            pad_val = tokenizer.pad_token_id if key == "input_ids" else (0 if key == "attention_mask" else -100)
-            tensors = []
-            for item in batch:
-                val = item[key]
-                if isinstance(val, torch.Tensor):
-                    t = val.clone().detach().to(dtype=torch.long)
-                else:
-                    t = torch.tensor(list(val), dtype=torch.long)
-                if len(t) < max_len:
-                    t = torch.cat([t, torch.full((max_len - len(t),), pad_val, dtype=torch.long)])
-                tensors.append(t)
-            padded[key] = torch.stack(tensors)
-        hallu_tensors = []
-        for item in batch:
-            val = item[head_name]
-            if isinstance(val, torch.Tensor):
-                vals = val.flatten().tolist()
-            elif isinstance(val, list):
-                vals = [v if isinstance(v, (int, float)) else v[0] for v in val]
-            else:
-                vals = list(val)
-            h = torch.tensor(vals, dtype=torch.float32)
-            if len(h) < max_len:
-                h = torch.cat([h, torch.full((max_len - len(h),), -1.0)])
-            hallu_tensors.append(h)
-        padded[head_name] = torch.stack(hallu_tensors)
-        return padded
+    def _extract_entry(item, key, dtype):
+        val = item[key]
+        if isinstance(val, torch.Tensor):
+            return val.to(dtype=dtype)
+        if isinstance(val, dict):
+            val = list(val.values())[0] if len(val) == 1 else list(val.values())
+        if isinstance(val, np.ndarray):
+            return torch.from_numpy(val).to(dtype=dtype)
+        return torch.tensor(list(val), dtype=dtype)
 
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, collate_fn=collate_mlp)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=collate_mlp)
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=collate_mlp)
+    def _dataset_to_tensors(ds):
+        entries = []
+        for i in range(len(ds)):
+            item = ds[i]
+            entries.append((
+                _extract_entry(item, "input_ids", torch.long),
+                _extract_entry(item, "attention_mask", torch.long),
+                _extract_entry(item, "labels", torch.long),
+                torch.tensor([v if isinstance(v, (int, float)) else v[0]
+                              for v in (item[head_name].tolist() if isinstance(item[head_name], torch.Tensor)
+                                        else item[head_name])], dtype=torch.float32),
+            ))
+        return entries
+
+    train_tensors = _dataset_to_tensors(train_dataset)
+    val_tensors = _dataset_to_tensors(val_dataset)
+    test_tensors = _dataset_to_tensors(test_dataset)
+
+    def collate_tensors(batch):
+        max_len = max(t[0].size(0) for t in batch)
+        B = len(batch)
+        input_ids = torch.full((B, max_len), tokenizer.pad_token_id, dtype=torch.long)
+        attn_mask = torch.zeros(B, max_len, dtype=torch.long)
+        labels = torch.full((B, max_len), -100, dtype=torch.long)
+        hallu = torch.full((B, max_len), -1.0)
+        for i, (ids, am, lbl, hl) in enumerate(batch):
+            L = ids.size(0)
+            input_ids[i, :L] = ids
+            attn_mask[i, :L] = am
+            labels[i, :L] = lbl
+            hallu[i, :L] = hl
+        return {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels, head_name: hallu}
+
+    train_loader = DataLoader(train_tensors, batch_size=1, shuffle=True, collate_fn=collate_tensors)
+    val_loader = DataLoader(val_tensors, batch_size=1, shuffle=False, collate_fn=collate_tensors)
+    test_loader = DataLoader(test_tensors, batch_size=1, shuffle=False, collate_fn=collate_tensors)
 
     GRAD_ACCUM = 8
     SCALE_FACTOR = GRAD_ACCUM
