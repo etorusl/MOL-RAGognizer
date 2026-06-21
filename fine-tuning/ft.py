@@ -564,6 +564,7 @@ if USE_MLP:
             elif hl.size(0) > L:
                 hl = hl[:L]
             entries.append((ids, am, lbl, hl))
+        print(f"_dataset_to_tensors: {len(entries)} samples, first hallu min={entries[0][3].min().item():.1f} max={entries[0][3].max().item():.1f} nonzero={(entries[0][3] != -1).sum().item()} nonneg={(entries[0][3] >= 0).sum().item()}")
         return entries
 
     train_tensors = _dataset_to_tensors(train_dataset)
@@ -644,6 +645,13 @@ if USE_MLP:
 
         all_probs_np = np.array(all_probs)
         all_labels_np = np.array(all_labels, dtype=int)
+        if len(all_labels_np) == 0:
+            return {
+                "loss": (total_lm_loss + total_hallu_loss) / max(num_batches, 1),
+                "roc_auc": 0.5,
+                "pr_auc": 0.0,
+                "best_threshold": 0.5,
+            }
         total_roc_auc = roc_auc_score(all_labels_np, all_probs_np)
         total_pr_auc = average_precision_score(all_labels_np, all_probs_np)
         fpr, tpr, thresholds = roc_curve(all_labels_np, all_probs_np)
