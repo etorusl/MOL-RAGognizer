@@ -493,12 +493,15 @@ if USE_MLP:
 
     if tokenizer.pad_token is None and PAD_TOKEN:
         tokenizer.add_special_tokens({"pad_token": PAD_TOKEN})
-        llm_model.config.pad_token_id = tokenizer.pad_token_id
         tokenizer.padding_side = "right"
-        if "reserved" not in PAD_TOKEN:
-            llm_model.resize_token_embeddings(len(tokenizer))
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    llm_model.config.pad_token_id = tokenizer.pad_token_id
+    if "reserved" not in str(tokenizer.pad_token):
+        llm_model.resize_token_embeddings(len(tokenizer))
 
-    num_layers = llm_model.config.num_hidden_layers + 1
+    cfg = llm_model.config
+    num_layers = (cfg.text_config if hasattr(cfg, 'text_config') else cfg).num_hidden_layers + 1
     hidden_size = llm_model.config.hidden_size
     layer_aggregator = LayerAggregator(num_layers).to("cuda")
     mlp = MLP(input_size=hidden_size, hidden_dims=MLP_HIDDEN_DIMS).to("cuda")

@@ -222,7 +222,8 @@ class RAGognizer(HallucinationDetector):
             self.mlp.load_state_dict(torch.load(weights_path))
             self.mlp.to(device).eval()
 
-            num_layers = self.llm.config.num_hidden_layers + 1
+            cfg = self.llm.config
+            num_layers = (cfg.text_config if hasattr(cfg, 'text_config') else cfg).num_hidden_layers + 1
             layer_weights_path = os.path.join(repo_dir, "mlp_layer_weights.pt")
 
             self.layer_aggregator = LayerAggregator(num_layers)
