@@ -429,28 +429,30 @@ if len(train_dataset) == 0:
         f"Use --allentries to train on all available responses, or switch to a model that exists in the dataset."
     )
 
-train_dataset.set_format(
-    type="torch",
-    columns=["input_ids", "attention_mask", head_name, "labels"],
-)
-val_dataset.set_format(
-    type="torch",
-    columns=["input_ids", "attention_mask", head_name, "labels"],
-)
-test_dataset.set_format(
-    type="torch",
-    columns=["input_ids", "attention_mask", head_name, "labels"],
-)
+if not USE_MLP:
+    train_dataset.set_format(
+        type="torch",
+        columns=["input_ids", "attention_mask", head_name, "labels"],
+    )
+    val_dataset.set_format(
+        type="torch",
+        columns=["input_ids", "attention_mask", head_name, "labels"],
+    )
+    test_dataset.set_format(
+        type="torch",
+        columns=["input_ids", "attention_mask", head_name, "labels"],
+    )
 
 # Calculcate weight for hallucinated tokens (to account for imbalance)
 zeros = 0
 ones = 0
 if BALANCED:
     for ten in train_dataset[head_name]:
-        zeros += (ten == 0).sum().item()
-        ones += (ten == 1).sum().item()
+        arr = np.array(ten) if isinstance(ten, list) else ten.numpy()
+        zeros += int((arr == 0).sum())
+        ones += int((arr == 1).sum())
 
-    ones_weight = 1 / (ones / (zeros + ones))
+    ones_weight = 1 / (ones / (zeros + ones)) if (zeros + ones) > 0 else 1.0
 else:
     ones_weight = 1.0
 
@@ -519,14 +521,25 @@ if USE_MLP:
             pad_val = tokenizer.pad_token_id if key == "input_ids" else (0 if key == "attention_mask" else -100)
             tensors = []
             for item in batch:
-                t = torch.tensor(item[key], dtype=torch.long)
+                val = item[key]
+                if isinstance(val, torch.Tensor):
+                    t = val.clone().detach().to(dtype=torch.long)
+                else:
+                    t = torch.tensor(list(val), dtype=torch.long)
                 if len(t) < max_len:
                     t = torch.cat([t, torch.full((max_len - len(t),), pad_val, dtype=torch.long)])
                 tensors.append(t)
             padded[key] = torch.stack(tensors)
         hallu_tensors = []
         for item in batch:
-            h = torch.tensor([v[0] for v in item[head_name]], dtype=torch.float32)
+            val = item[head_name]
+            if isinstance(val, torch.Tensor):
+                vals = val.flatten().tolist()
+            elif isinstance(val, list):
+                vals = [v if isinstance(v, (int, float)) else v[0] for v in val]
+            else:
+                vals = list(val)
+            h = torch.tensor(vals, dtype=torch.float32)
             if len(h) < max_len:
                 h = torch.cat([h, torch.full((max_len - len(h),), -1.0)])
             hallu_tensors.append(h)
