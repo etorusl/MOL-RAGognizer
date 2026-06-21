@@ -516,16 +516,17 @@ if USE_MLP:
 
     def _extract_entry(item, key, dtype):
         val = item[key]
-        if isinstance(val, torch.Tensor):
-            t = val.to(dtype=dtype)
-        elif isinstance(val, dict):
-            val = list(val.values())[0] if len(val) == 1 else list(val.values())
-            t = torch.tensor(val, dtype=dtype)
-        elif isinstance(val, np.ndarray):
-            t = torch.from_numpy(val).to(dtype=dtype)
-        else:
-            t = torch.tensor(list(val), dtype=dtype)
-        return t.view(-1)
+        try:
+            return torch.tensor(val, dtype=dtype).view(-1)
+        except (TypeError, ValueError):
+            pass
+        if isinstance(val, dict):
+            vals = list(val.values())
+            if len(vals) == 1:
+                val = vals[0]
+            else:
+                val = vals
+        return torch.tensor(val, dtype=dtype).view(-1)
 
     def _dataset_to_tensors(ds):
         entries = []
