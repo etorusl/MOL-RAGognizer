@@ -89,8 +89,9 @@ try:
     _processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True)
     if hasattr(_processor, 'tokenizer'):
         tokenizer = _processor.tokenizer
-except Exception:
-    print(f"Warning: AutoProcessor failed (missing torchvision?), using AutoTokenizer only")
+    print(f"AutoProcessor loaded OK for {MODEL_NAME}")
+except Exception as e:
+    print(f"Warning: AutoProcessor failed ({e}), using AutoTokenizer only")
 
 def _apply_chat_template(messages, tokenize=True, add_generation_prompt=False, **kwargs):
     if _processor is not None:
