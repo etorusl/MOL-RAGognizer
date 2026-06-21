@@ -502,7 +502,7 @@ if USE_MLP:
 
     cfg = llm_model.config
     num_layers = (cfg.text_config if hasattr(cfg, 'text_config') else cfg).num_hidden_layers + 1
-    hidden_size = llm_model.config.hidden_size
+    hidden_size = (cfg.text_config if hasattr(cfg, 'text_config') else cfg).hidden_size
     layer_aggregator = LayerAggregator(num_layers).to("cuda")
     mlp = MLP(input_size=hidden_size, hidden_dims=MLP_HIDDEN_DIMS).to("cuda")
 
