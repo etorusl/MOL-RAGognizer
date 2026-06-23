@@ -45,6 +45,8 @@ parser.add_argument("--headatend", action="store_true")
 parser.add_argument("--quantized", action="store_true")
 parser.add_argument("--mlp", action="store_true", help="Use separate MLP + LayerAggregator instead of transformer-heads")
 parser.add_argument("--mlp_hidden_dims", type=str, default="1024,512", help="Comma-separated MLP hidden dimensions")
+parser.add_argument("--multimodal", action="store_true", help="Use multimodal dataset (shroom-vision) instead of RAGognize")
+parser.add_argument("--image_dir", type=str, default="./images/shroom", help="Directory containing images referenced by dataset")
 args = parser.parse_args()
 
 EVAL_PERC = 0.15 # For RAGTruth
@@ -61,6 +63,8 @@ HEAD_AT_END = args.headatend
 QUANTIZED = args.quantized
 USE_MLP = args.mlp
 MLP_HIDDEN_DIMS = [int(x) for x in args.mlp_hidden_dims.split(",")]
+USE_MULTIMODAL = args.multimodal
+IMAGE_DIR = args.image_dir
 
 PAD_TOKEN = {
     "meta-llama/Llama-2-7b-chat-hf": "<pad>",
@@ -92,6 +96,9 @@ try:
     print(f"AutoProcessor loaded OK for {MODEL_NAME}")
 except Exception as e:
     print(f"Warning: AutoProcessor failed ({e}), using AutoTokenizer only")
+
+if USE_MULTIMODAL and _processor is None:
+    raise RuntimeError("Multimodal mode requires AutoProcessor. Install torchvision and ensure preprocessor_config.json is downloaded.")
 
 def _apply_chat_template(messages, tokenize=True, add_generation_prompt=False, **kwargs):
     text = tokenizer.apply_chat_template(messages, tokenize=False,
@@ -424,7 +431,119 @@ def formatted_ragtruth(get_test: bool=False, eval_perc: float=None):
     else:
         return Dataset.from_list(train_entries), Dataset.from_list(val_entries)
 
-if USE_RAGTRUTH:
+
+def formatted_multimodal(dataset_dir, image_dir, processor):
+    import glob
+    jsonl_files = sorted(glob.glob(os.path.join(dataset_dir, "*.labeled.jsonl")))
+    if not jsonl_files:
+        raise FileNotFoundError(f"No labeled JSONL files found in {dataset_dir}")
+    print(f"Loading multimodal data from: {jsonl_files}")
+
+    raw_entries = []
+    for fpath in jsonl_files:
+        with open(fpath) as f:
+            for line in f:
+                raw_entries.append(json.loads(line))
+    print(f"Total raw entries: {len(raw_entries)}")
+
+    entries = []
+    for entry in raw_entries:
+        response = entry["response"]
+        prompt_text = entry["prompt"]
+        image_path = os.path.join(image_dir, entry["image_name"])
+        if not os.path.exists(image_path):
+            continue
+
+        user_content = [
+            {"type": "image", "url": image_path},
+            {"type": "text", "text": prompt_text},
+        ]
+        full_msgs = [
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": response},
+        ]
+        user_msgs = [
+            {"role": "user", "content": user_content},
+        ]
+
+        try:
+            full_ids = _apply_chat_template(full_msgs, tokenize=True, add_generation_prompt=False)
+            user_ids = _apply_chat_template(user_msgs, tokenize=True, add_generation_prompt=True)
+        except Exception as e:
+            print(f"WARNING: Failed to tokenize entry {entry.get('id', '?')}: {e}")
+            continue
+
+        assistant_token_start = len(user_ids)
+        if isinstance(full_ids, list):
+            full_ids = torch.tensor(full_ids, dtype=torch.long)
+
+        token_starts = []
+        ass_tokens = full_ids[assistant_token_start:]
+        last_start = 0
+        for ass_i in range(len(ass_tokens)):
+            curr_text = tokenizer.decode(ass_tokens[:ass_i+1], skip_special_tokens=True)
+            try:
+                starts_at = response.index(curr_text) + len(tokenizer.decode(ass_tokens[:ass_i], skip_special_tokens=True))
+            except Exception:
+                starts_at = last_start + 1 if ass_i > 0 else 0
+            token_starts.append(starts_at)
+            last_start = starts_at
+
+        label_per_token = np.zeros(len(token_starts), dtype=bool)
+        for lbl in entry.get("labels", []):
+            first = len(token_starts) - 1
+            try:
+                while token_starts[first] > lbl["start"]:
+                    first -= 1
+            except Exception:
+                first = 0
+            first = max(0, min(first, len(token_starts) - 1))
+            last = 0
+            try:
+                while token_starts[last] < lbl["end"]:
+                    last += 1
+            except Exception:
+                last = len(token_starts) - 1
+            last = max(0, min(last, len(token_starts) - 1))
+            label_per_token[first:last] |= True
+
+        if MASKED:
+            label_per_token = nan_following_true_groups(mask_mixed_windows(label_per_token, false_l=8, true_l=3, min_true_group_size=3)).astype(float)
+            label_per_token[np.isnan(label_per_token)] = -1
+
+        labels_before_response = np.full(len(full_ids) - len(label_per_token), -1.0)
+        hallu_per_token = np.concatenate([labels_before_response, label_per_token.astype(float)]).tolist()
+
+        entry_tok = {
+            "input_ids": full_ids.tolist() if isinstance(full_ids, torch.Tensor) else list(full_ids),
+            "attention_mask": np.ones(len(full_ids), dtype=np.int32).tolist(),
+            "labels": full_ids.tolist() if isinstance(full_ids, torch.Tensor) else list(full_ids),
+            head_name: [[h] for h in hallu_per_token],
+            "image_path": image_path,
+        }
+        for label_i in range(assistant_token_start):
+            entry_tok["labels"][label_i] = -100
+
+        entries.append(entry_tok)
+
+    if len(entries) == 0:
+        raise RuntimeError("No valid entries produced. Check image_dir path and dataset compatibility.")
+
+    e0 = entries[0]
+    hp = np.array([h[0] for h in e0[head_name]])
+    print(f"DEBUG multimodal: {len(entries)} entries, ids={len(e0['input_ids'])} hallu_nonneg={int((hp >= 0).sum())} hallu_ones={int((hp == 1).sum())}")
+
+    ds = Dataset.from_list(entries)
+    split_ds = ds.train_test_split(test_size=0.1, seed=42)
+    return split_ds["train"], split_ds["test"]
+
+if USE_MULTIMODAL:
+    train_dataset, val_dataset = formatted_multimodal(
+        args.dataset, IMAGE_DIR,
+        _processor if _processor is not None else tokenizer
+    )
+    test_dataset = val_dataset
+elif USE_RAGTRUTH:
     train_dataset, val_dataset = formatted_ragtruth()
     test_dataset = formatted_ragtruth(get_test=True)
 else:
@@ -492,6 +611,7 @@ if USE_MLP:
     import torch.nn.functional as F
     from ragognizer.detectors.RAGognizer import LayerAggregator, MLP
     from torch.optim import AdamW
+    from PIL import Image
 
     quantization_config_mlp = None
     if QUANTIZED:
@@ -584,7 +704,7 @@ if USE_MLP:
                 hl = torch.cat([hl, torch.full((L - hl.size(0),), -1.0)])
             elif hl.size(0) > L:
                 hl = hl[:L]
-            entries.append((ids, am, lbl, hl))
+            entries.append((ids, am, lbl, hl, item.get("image_path", None)))
         print(f"_dataset_to_tensors: {len(entries)} samples, first hallu min={entries[0][3].min().item():.1f} max={entries[0][3].max().item():.1f} nonzero={(entries[0][3] != -1).sum().item()} nonneg={(entries[0][3] >= 0).sum().item()}")
         return entries
 
@@ -599,13 +719,26 @@ if USE_MLP:
         attn_mask = torch.zeros(B, max_len, dtype=torch.long)
         labels = torch.full((B, max_len), -100, dtype=torch.long)
         hallu = torch.full((B, max_len), -1.0)
-        for i, (ids, am, lbl, hl) in enumerate(batch):
+        pixel_values_list = []
+        image_sizes_list = []
+        for i, tup in enumerate(batch):
+            ids, am, lbl, hl, img_path = tup
             L = ids.size(0)
             input_ids[i, :L] = ids
             attn_mask[i, :L] = am
             labels[i, :L] = lbl
             hallu[i, :L] = hl
-        return {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels, head_name: hallu}
+            if USE_MULTIMODAL and img_path is not None:
+                from PIL import Image
+                img = Image.open(img_path).convert("RGB")
+                proc_inputs = _processor(image=img, return_tensors="pt")
+                pixel_values_list.append(proc_inputs["pixel_values"].squeeze(0))
+                image_sizes_list.append(proc_inputs.get("image_sizes", torch.tensor(img.size[::-1])).squeeze(0))
+        batch_dict = {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels, head_name: hallu}
+        if pixel_values_list:
+            batch_dict["pixel_values"] = torch.stack(pixel_values_list)
+            batch_dict["image_sizes"] = torch.stack(image_sizes_list)
+        return batch_dict
 
     train_loader = DataLoader(train_tensors, batch_size=1, shuffle=True, collate_fn=collate_tensors)
     val_loader = DataLoader(val_tensors, batch_size=1, shuffle=False, collate_fn=collate_tensors)
@@ -633,6 +766,8 @@ if USE_MLP:
                 outputs = llm_model(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
+                    pixel_values=batch.get("pixel_values"),
+                    image_sizes=batch.get("image_sizes"),
                     output_hidden_states=True,
                 )
                 shift_logits = outputs.logits[..., :-1, :].contiguous()
