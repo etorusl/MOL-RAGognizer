@@ -559,7 +559,6 @@ if USE_MLP:
     import torch.nn.functional as F
     from ragognizer.detectors.RAGognizer import LayerAggregator, MLP
     from torch.optim import AdamW
-    from PIL import Image
 
     quantization_config_mlp = None
     if QUANTIZED:
@@ -718,8 +717,8 @@ if USE_MLP:
                 "attention_mask": torch.ones(len(full_ids), dtype=torch.long),
                 "labels": torch.tensor(lbls, dtype=torch.long),
                 head_name: torch.tensor(hallu_per_token, dtype=torch.float32),
-                "pixel_values": inputs["pixel_values"][0] if "pixel_values" in inputs else None,
-                "image_sizes": inputs.get("image_sizes", torch.tensor([1, 1]))[0] if "image_sizes" in inputs else torch.tensor([1, 1]),
+                "pixel_values": inputs["pixel_values"] if "pixel_values" in inputs else None,
+                "image_sizes": inputs.get("image_sizes", None),
             }
 
         def _collate_multimodal(batch):
@@ -742,11 +741,10 @@ if USE_MLP:
                     is_list.append(b["image_sizes"])
             d = {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels, head_name: hallu}
             if pv_list:
-                d["pixel_values"] = torch.stack(pv_list)
-                d["image_sizes"] = torch.stack(is_list)
+                d["pixel_values"] = torch.cat(pv_list, dim=0)
+                d["image_sizes"] = torch.cat(is_list, dim=0)
             return d
 
-        from PIL import Image as PILImage
         class MultiModalTensorWrapper:
             def __init__(self, ds): self.ds = ds
             def __len__(self): return len(self.ds)
