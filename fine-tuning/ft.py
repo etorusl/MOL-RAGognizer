@@ -717,8 +717,7 @@ if USE_MLP:
                 "attention_mask": torch.ones(len(full_ids), dtype=torch.long),
                 "labels": torch.tensor(lbls, dtype=torch.long),
                 head_name: torch.tensor(hallu_per_token, dtype=torch.float32),
-                "pixel_values": inputs["pixel_values"] if "pixel_values" in inputs else None,
-                "image_sizes": inputs.get("image_sizes", None),
+                "proc_inputs": {k: v for k, v in inputs.items() if k not in ("input_ids", "attention_mask")},
             }
 
         def _collate_multimodal(batch):
@@ -728,21 +727,20 @@ if USE_MLP:
             attn_mask = torch.zeros(B, max_len, dtype=torch.long)
             labels = torch.full((B, max_len), -100, dtype=torch.long)
             hallu = torch.full((B, max_len), -1.0)
-            pv_list = []
-            is_list = []
+            proc_lists = {}
             for i, b in enumerate(batch):
                 L = b["input_ids"].size(0)
                 input_ids[i, :L] = b["input_ids"]
                 attn_mask[i, :L] = b["attention_mask"]
                 labels[i, :L] = b["labels"]
                 hallu[i, :L] = b[head_name]
-                if b["pixel_values"] is not None:
-                    pv_list.append(b["pixel_values"])
-                    is_list.append(b["image_sizes"] if b["image_sizes"] is not None else torch.tensor([[1, 1]]))
+                for pk, pv in b.get("proc_inputs", {}).items():
+                    if pv is not None:
+                        proc_lists.setdefault(pk, []).append(pv)
             d = {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels, head_name: hallu}
-            if pv_list:
-                d["pixel_values"] = torch.cat(pv_list, dim=0)
-                d["image_sizes"] = torch.cat(is_list, dim=0)
+            for pk, plist in proc_lists.items():
+                if plist:
+                    d[pk] = torch.cat(plist, dim=0)
             return d
 
         class MultiModalTensorWrapper:
@@ -802,13 +800,11 @@ if USE_MLP:
         for batch in tqdm(loader, desc="Evaluating"):
             batch = {k: v.to("cuda") for k, v in batch.items()}
             with torch.no_grad():
-                outputs = llm_model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    pixel_values=batch.get("pixel_values"),
-                    image_sizes=batch.get("image_sizes"),
-                    output_hidden_states=True,
-                )
+                model_kwargs = {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"], "output_hidden_states": True}
+                for k, v in batch.items():
+                    if k not in ("input_ids", "attention_mask", "labels", head_name):
+                        model_kwargs[k] = v
+                outputs = llm_model(**model_kwargs)
                 shift_logits = outputs.logits[..., :-1, :].contiguous()
                 shift_labels = batch["labels"][..., 1:].contiguous()
                 lm_loss = F.cross_entropy(
