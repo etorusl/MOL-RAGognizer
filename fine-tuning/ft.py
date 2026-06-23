@@ -447,11 +447,15 @@ def formatted_multimodal(dataset_dir, image_dir, processor):
     print(f"Total raw entries: {len(raw_entries)}")
 
     entries = []
+    missing = 0
     for entry in raw_entries:
         response = entry["response"]
         prompt_text = entry["prompt"]
         image_path = os.path.join(image_dir, entry["image_name"])
         if not os.path.exists(image_path):
+            missing += 1
+            if missing == 1:
+                print(f"First missing image: {image_path}")
             continue
 
         user_content = [
@@ -527,7 +531,7 @@ def formatted_multimodal(dataset_dir, image_dir, processor):
         entries.append(entry_tok)
 
     if len(entries) == 0:
-        raise RuntimeError("No valid entries produced. Check image_dir path and dataset compatibility.")
+        raise RuntimeError(f"No valid entries produced ({missing} images missing, dir: {image_dir}). Check image_dir path.")
 
     e0 = entries[0]
     hp = np.array([h[0] for h in e0[head_name]])
