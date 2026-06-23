@@ -735,7 +735,7 @@ if USE_MLP:
             if USE_MULTIMODAL and img_path is not None:
                 from PIL import Image
                 img = Image.open(img_path).convert("RGB")
-                proc_inputs = _processor(image=img, return_tensors="pt")
+                proc_inputs = _processor(images=img, return_tensors="pt")
                 pixel_values_list.append(proc_inputs["pixel_values"].squeeze(0))
                 image_sizes_list.append(proc_inputs.get("image_sizes", torch.tensor(img.size[::-1])).squeeze(0))
         batch_dict = {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels, head_name: hallu}
