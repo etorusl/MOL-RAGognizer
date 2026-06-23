@@ -47,6 +47,7 @@ parser.add_argument("--mlp", action="store_true", help="Use separate MLP + Layer
 parser.add_argument("--mlp_hidden_dims", type=str, default="1024,512", help="Comma-separated MLP hidden dimensions")
 parser.add_argument("--multimodal", action="store_true", help="Use multimodal dataset (shroom-vision) instead of RAGognize")
 parser.add_argument("--image_dir", type=str, default="./images/shroom", help="Directory containing images referenced by dataset")
+parser.add_argument("--lang", type=str, default="all", help="Language filter for multimodal: en, fr, it, zh, or all (default)")
 args = parser.parse_args()
 
 EVAL_PERC = 0.15 # For RAGTruth
@@ -65,6 +66,7 @@ USE_MLP = args.mlp
 MLP_HIDDEN_DIMS = [int(x) for x in args.mlp_hidden_dims.split(",")]
 USE_MULTIMODAL = args.multimodal
 IMAGE_DIR = args.image_dir
+LANG = args.lang
 
 PAD_TOKEN = {
     "meta-llama/Llama-2-7b-chat-hf": "<pad>",
@@ -432,11 +434,15 @@ def formatted_ragtruth(get_test: bool=False, eval_perc: float=None):
         return Dataset.from_list(train_entries), Dataset.from_list(val_entries)
 
 
-def formatted_multimodal(dataset_dir, image_dir):
+def formatted_multimodal(dataset_dir, image_dir, lang):
     import glob
-    jsonl_files = sorted(glob.glob(os.path.join(dataset_dir, "*.labeled.jsonl")))
+    if lang == "all":
+        pattern = "*.labeled.jsonl"
+    else:
+        pattern = f"*.{lang}.labeled.jsonl"
+    jsonl_files = sorted(glob.glob(os.path.join(dataset_dir, pattern)))
     if not jsonl_files:
-        raise FileNotFoundError(f"No labeled JSONL files found in {dataset_dir}")
+        raise FileNotFoundError(f"No labeled JSONL files found in {dataset_dir} matching '{pattern}' (lang={lang})")
     print(f"Loading multimodal data from: {jsonl_files}")
 
     raw_entries = []
@@ -488,7 +494,7 @@ def formatted_multimodal(dataset_dir, image_dir):
 
 if USE_MULTIMODAL:
     train_dataset, val_dataset = formatted_multimodal(
-        args.dataset, IMAGE_DIR
+        args.dataset, IMAGE_DIR, LANG
     )
     test_dataset = val_dataset
 elif USE_RAGTRUTH:
