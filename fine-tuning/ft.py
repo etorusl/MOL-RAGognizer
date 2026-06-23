@@ -738,7 +738,7 @@ if USE_MLP:
                 hallu[i, :L] = b[head_name]
                 if b["pixel_values"] is not None:
                     pv_list.append(b["pixel_values"])
-                    is_list.append(b["image_sizes"])
+                    is_list.append(b["image_sizes"] if b["image_sizes"] is not None else torch.tensor([[1, 1]]))
             d = {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels, head_name: hallu}
             if pv_list:
                 d["pixel_values"] = torch.cat(pv_list, dim=0)
