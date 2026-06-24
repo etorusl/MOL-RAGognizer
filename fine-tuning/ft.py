@@ -1034,12 +1034,6 @@ if USE_MLP:
                     cat_loss = F.cross_entropy(
                         cat_logits[cmask], batch["cat_labels"][cmask], ignore_index=-100
                     )
-            probs = torch.sigmoid(hallu_logits[mask]).cpu().numpy()
-            labels_np = hallu_labels[mask].cpu().numpy()
-            all_probs.extend(probs.tolist())
-            all_labels.extend(labels_np.tolist())
-            total_lm_loss += lm_loss.item()
-            total_hallu_loss += hallu_loss.item() + cat_loss.item()
             loss = (lm_loss + hallu_loss + cat_loss) / SCALE_FACTOR
             loss.backward()
             total_loss_epoch += loss.item() * SCALE_FACTOR
