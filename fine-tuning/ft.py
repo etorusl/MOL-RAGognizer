@@ -862,7 +862,7 @@ if USE_MLP:
             with torch.no_grad():
                 model_kwargs = {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"], "output_hidden_states": True}
                 for k, v in batch.items():
-                    if k not in ("input_ids", "attention_mask", "labels", head_name):
+                    if k not in ("input_ids", "attention_mask", "labels", head_name, "cat_labels", "token_prob"):
                         model_kwargs[k] = v
                 outputs = llm_model(**model_kwargs)
                 shift_logits = outputs.logits[..., :-1, :].contiguous()
@@ -997,13 +997,15 @@ if USE_MLP:
 
         progress = tqdm(train_loader, desc=f"Epoch {epoch+1}")
         for bi, batch in enumerate(progress):
-            batch = {k: v.to("cuda") for k, v in batch.items()}
+            batch.pop("response_texts", None)
+            batch.pop("token_starts", None)
+            batch = {k: v.to("cuda") for k, v in batch.items() if isinstance(v, torch.Tensor)}
 
-            outputs = llm_model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                output_hidden_states=True,
-            )
+            model_kwargs = {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"], "output_hidden_states": True}
+            for k, v in batch.items():
+                if k not in ("input_ids", "attention_mask", "labels", head_name, "cat_labels", "token_prob"):
+                    model_kwargs[k] = v
+            outputs = llm_model(**model_kwargs)
             shift_logits = outputs.logits[..., :-1, :].contiguous()
             shift_labels = batch["labels"][..., 1:].contiguous()
             lm_loss = F.cross_entropy(
