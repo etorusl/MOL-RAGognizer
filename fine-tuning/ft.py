@@ -600,7 +600,7 @@ if USE_MLP:
     num_layers = (cfg.text_config if hasattr(cfg, 'text_config') else cfg).num_hidden_layers + 1
     hidden_size = (cfg.text_config if hasattr(cfg, 'text_config') else cfg).hidden_size
     layer_aggregator = LayerAggregator(num_layers).to("cuda")
-    mlp = MLP(input_size=hidden_size, hidden_dims=MLP_HIDDEN_DIMS).to("cuda")
+    mlp = MLP(input_size=hidden_size, hidden_dims=MLP_HIDDEN_DIMS, output_size=6).to("cuda")
 
     optimizer = AdamW([
         {"params": [p for n, p in llm_model.named_parameters() if p.requires_grad], "lr": 4e-5},
@@ -698,22 +698,34 @@ if USE_MLP:
                     starts_at = last_start + 1 if ass_i > 0 else 0
                 token_starts.append(starts_at)
                 last_start = starts_at
+            CAT_MAP = {"invention": 0, "mischaracterization": 1, "OCR": 2, "miscounting": 3, "other": 4}
             label_per_token = np.zeros(len(token_starts), dtype=bool)
+            cat_per_token = np.full(len(token_starts), -100, dtype=int)
+            span_best = {}
             for lbl in item.get("labels_raw", []):
+                key = (lbl["start"], lbl["end"])
+                if key not in span_best or lbl["prob"] > span_best[key]["prob"]:
+                    span_best[key] = lbl
+            for (start, end), lbl in span_best.items():
                 first = len(token_starts) - 1
                 try:
-                    while token_starts[first] > lbl["start"]: first -= 1
+                    while token_starts[first] > start: first -= 1
                 except Exception: first = 0
                 first = max(0, min(first, len(token_starts) - 1))
                 last = 0
                 try:
-                    while token_starts[last] < lbl["end"]: last += 1
+                    while token_starts[last] < end: last += 1
                 except Exception: last = len(token_starts) - 1
                 last = max(0, min(last, len(token_starts) - 1))
-                label_per_token[first:last] |= True
+                label_per_token[first:last] = True
+                cat_per_token[first:last] = CAT_MAP.get(lbl["label"], 4)
             hallu_per_token = np.concatenate([
                 np.full(len(full_ids) - len(label_per_token), -1.0),
                 label_per_token.astype(float)
+            ]).tolist()
+            cat_per_token_full = np.concatenate([
+                np.full(len(full_ids) - len(cat_per_token), -100, dtype=int),
+                cat_per_token
             ]).tolist()
             lbls = list(full_ids.numpy())
             for li in range(asst_start):
@@ -723,6 +735,7 @@ if USE_MLP:
                 "attention_mask": torch.ones(len(full_ids), dtype=torch.long),
                 "labels": torch.tensor(lbls, dtype=torch.long),
                 head_name: torch.tensor(hallu_per_token, dtype=torch.float32),
+                "cat_labels": torch.tensor(cat_per_token_full, dtype=torch.long),
                 "proc_inputs": {k: v for k, v in inputs.items() if k not in ("input_ids", "attention_mask")},
             }
 
@@ -733,6 +746,7 @@ if USE_MLP:
             attn_mask = torch.zeros(B, max_len, dtype=torch.long)
             labels = torch.full((B, max_len), -100, dtype=torch.long)
             hallu = torch.full((B, max_len), -1.0)
+            cat_lbls = torch.full((B, max_len), -100, dtype=torch.long)
             proc_lists = {}
             for i, b in enumerate(batch):
                 L = b["input_ids"].size(0)
@@ -740,10 +754,11 @@ if USE_MLP:
                 attn_mask[i, :L] = b["attention_mask"]
                 labels[i, :L] = b["labels"]
                 hallu[i, :L] = b[head_name]
+                cat_lbls[i, :L] = b["cat_labels"]
                 for pk, pv in b.get("proc_inputs", {}).items():
                     if pv is not None:
                         proc_lists.setdefault(pk, []).append(pv)
-            d = {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels, head_name: hallu}
+            d = {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels, head_name: hallu, "cat_labels": cat_lbls}
             for pk, plist in proc_lists.items():
                 if plist:
                     d[pk] = torch.cat(plist, dim=0)
@@ -762,6 +777,11 @@ if USE_MLP:
         test_loader = DataLoader(MultiModalTensorWrapper(test_dataset), batch_size=1,
                                  shuffle=False, collate_fn=_collate_multimodal)
         print("DEBUG multimodal: loaders ready")
+        # Show category distribution on first item
+        first_cat = _tokenize_multimodal_item(train_dataset[0])["cat_labels"]
+        nonneg = (first_cat >= 0).sum().item()
+        cats, counts = torch.unique(first_cat[first_cat >= 0], return_counts=True)
+        print(f"First item cat_labels: nonneg={nonneg}, cats={dict(zip(cats.tolist(), counts.tolist()))}")
     else:
         train_tensors = _dataset_to_tensors(train_dataset)
         val_tensors = _dataset_to_tensors(val_dataset)
@@ -820,7 +840,9 @@ if USE_MLP:
                 )
                 hidden_states = torch.stack(outputs.hidden_states, dim=1)
                 aggregated = layer_aggregator(hidden_states)
-                hallu_logits = mlp(aggregated).squeeze(-1)
+                hallu_logits_all = mlp(aggregated)
+                hallu_logits = hallu_logits_all[:, 0]
+                cat_logits = hallu_logits_all[:, 1:] if hallu_logits_all.size(1) > 1 else None
                 hallu_labels = batch[head_name]
                 mask = hallu_labels >= -0.1
                 if mask.any():
@@ -830,12 +852,19 @@ if USE_MLP:
                     )
                 else:
                     hallu_loss = torch.tensor(0.0, device="cuda")
+                cat_loss = torch.tensor(0.0, device="cuda")
+                if cat_logits is not None and "cat_labels" in batch:
+                    cmask = batch["cat_labels"] >= 0
+                    if cmask.any():
+                        cat_loss = F.cross_entropy(
+                            cat_logits[cmask], batch["cat_labels"][cmask], ignore_index=-100
+                        )
                 probs = torch.sigmoid(hallu_logits[mask]).cpu().numpy()
                 labels_np = hallu_labels[mask].cpu().numpy()
                 all_probs.extend(probs.tolist())
                 all_labels.extend(labels_np.tolist())
                 total_lm_loss += lm_loss.item()
-                total_hallu_loss += hallu_loss.item()
+                total_hallu_loss += hallu_loss.item() + cat_loss.item()
                 num_batches += 1
             del outputs, aggregated, hallu_logits, hallu_labels
             torch.cuda.empty_cache()
@@ -899,7 +928,9 @@ if USE_MLP:
             )
             hidden_states = torch.stack(outputs.hidden_states, dim=1)
             aggregated = layer_aggregator(hidden_states)
-            hallu_logits = mlp(aggregated).squeeze(-1)
+            hallu_logits_all = mlp(aggregated)
+            hallu_logits = hallu_logits_all[:, 0]
+            cat_logits = hallu_logits_all[:, 1:] if hallu_logits_all.size(1) > 1 else None
             hallu_labels = batch[head_name]
             mask = hallu_labels >= -0.1
             if mask.any():
@@ -909,8 +940,20 @@ if USE_MLP:
                 )
             else:
                 hallu_loss = torch.tensor(0.0, device="cuda")
-
-            loss = (lm_loss + hallu_loss) / SCALE_FACTOR
+            cat_loss = torch.tensor(0.0, device="cuda")
+            if cat_logits is not None and "cat_labels" in batch:
+                cmask = batch["cat_labels"] >= 0
+                if cmask.any():
+                    cat_loss = F.cross_entropy(
+                        cat_logits[cmask], batch["cat_labels"][cmask], ignore_index=-100
+                    )
+            probs = torch.sigmoid(hallu_logits[mask]).cpu().numpy()
+            labels_np = hallu_labels[mask].cpu().numpy()
+            all_probs.extend(probs.tolist())
+            all_labels.extend(labels_np.tolist())
+            total_lm_loss += lm_loss.item()
+            total_hallu_loss += hallu_loss.item() + cat_loss.item()
+            loss = (lm_loss + hallu_loss + cat_loss) / SCALE_FACTOR
             loss.backward()
             total_loss_epoch += loss.item() * SCALE_FACTOR
 

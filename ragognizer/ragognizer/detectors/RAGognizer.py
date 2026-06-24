@@ -34,7 +34,7 @@ class PostProcessor(torch.nn.Module):
         return self.seq(x.float())
 
 class MLP(nn.Module):
-    def __init__(self, input_size, hidden_dims):
+    def __init__(self, input_size, hidden_dims, output_size=1):
         super(MLP, self).__init__()
         layers = []
         prev_dim = input_size
@@ -43,13 +43,14 @@ class MLP(nn.Module):
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(0.2))
             prev_dim = h_dim
-        layers.append(nn.Linear(prev_dim, 1))
+        layers.append(nn.Linear(prev_dim, output_size))
         
         self.network = nn.Sequential(*layers)
 
         self.config = {
             "input_size": input_size,
             "hidden_dims": hidden_dims,
+            "output_size": output_size,
         }
 
     def forward(self, x):
@@ -420,6 +421,9 @@ class RAGognizer(HallucinationDetector):
             aggregated = self.layer_aggregator(cevs)
 
             logits = self.mlp(aggregated)
+            if logits.dim() == 2 and logits.size(1) > 1:
+                self._cat_logits = logits[:, 1:].detach().cpu()
+                logits = logits[:, 0:1]
             probs = torch.sigmoid(logits).detach().cpu().flatten()
 
         if self.postprocessor is not None:
@@ -608,6 +612,8 @@ class RAGognizer(HallucinationDetector):
 
                 aggregated = self.layer_aggregator(last_token_hidden_states.to(self.device))
                 logits = self.mlp(aggregated)
+                if logits.dim() == 2 and logits.size(1) > 1:
+                    logits = logits[:, 0:1]
                 prob = torch.sigmoid(logits).detach().cpu().flatten().item()
 
             all_raw_probs.append(prob)
