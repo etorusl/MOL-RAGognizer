@@ -928,60 +928,89 @@ if USE_MLP:
         if len(all_labels_np) == 0:
             return {
                 "loss": (total_lm_loss + total_hallu_loss) / max(num_batches, 1),
-                "roc_auc": 0.5,
-                "pr_auc": 0.0,
-                "best_threshold": 0.5,
+                "roc_auc": 0.5, "pr_auc": 0.0, "best_threshold": 0.5,
+                "span_iou": 0.0, "best_iou_threshold": 0.5, "calib_corr": 0.0,
+                "class_roc": {}, "span_debug": [],
             }
         total_roc_auc = roc_auc_score(all_labels_np, all_probs_np)
         total_pr_auc = average_precision_score(all_labels_np, all_probs_np)
         fpr, tpr, thresholds = roc_curve(all_labels_np, all_probs_np)
         best_threshold = thresholds[np.argmax(tpr - fpr)]
 
-        # Span IoU (character-level) — using best_threshold from ROC
-        span_ious = []
-        span_debug = []  # per-sample debug data
+        # Span IoU (character-level) — try multiple thresholds, pick best
+        span_iou = 0.0
+        best_iou_threshold = 0.5
+        span_debug = []
+        thresholds_to_try = sorted(set([0.3, 0.4, 0.5, 0.6, 0.7] + [round(best_threshold, 2)]))
+        for thr in thresholds_to_try:
+            span_ious_thr = []
+            debug_thr = []
+            for hallu_preds_raw, hallu_gold, token_starts_list, response_texts, asst_mask in all_iou_data:
+                hallu_preds_bin = hallu_preds_raw > thr
+                for si in range(len(hallu_preds_bin)):
+                    ts = token_starts_list[si] if si < len(token_starts_list) else []
+                    resp_len = len(response_texts[si]) if si < len(response_texts) else 0
+                    preds_asst = hallu_preds_bin[si][asst_mask[si]] if si < len(asst_mask) else hallu_preds_bin[si]
+                    golds_asst = hallu_gold[si][asst_mask[si]] if si < len(asst_mask) else hallu_gold[si]
+                    if not preds_asst.any() and not golds_asst.any():
+                        continue
+                    pred_spans, gold_spans = [], []
+                    for arr, spans in [(preds_asst, pred_spans), (golds_asst, gold_spans)]:
+                        in_span = False
+                        span_start = 0
+                        for j in range(min(len(ts), len(arr))):
+                            if arr[j] and not in_span:
+                                span_start = ts[j]
+                                in_span = True
+                            elif not arr[j] and in_span:
+                                spans.append((span_start, ts[j] if j < len(ts) else resp_len))
+                                in_span = False
+                        if in_span:
+                            spans.append((span_start, resp_len))
+                    pred_set = set()
+                    gold_set = set()
+                    for s, e in pred_spans: pred_set.update(range(s, e))
+                    for s, e in gold_spans: gold_set.update(range(s, e))
+                    inter = len(pred_set & gold_set)
+                    union = len(pred_set | gold_set)
+                    if union > 0:
+                        span_ious_thr.append(inter / union)
+            mean_iou = float(np.mean(span_ious_thr)) if span_ious_thr else 0.0
+            if mean_iou >= span_iou:
+                span_iou = mean_iou
+                best_iou_threshold = thr
+                if thr == thresholds_to_try[-1] or mean_iou > 0:
+                    span_debug = []  # fill debug only for best threshold
+                    # Recompute with best threshold (already done — span_debug is empty, just note the threshold)
+        # Rebuild span_debug with best threshold
         for hallu_preds_raw, hallu_gold, token_starts_list, response_texts, asst_mask in all_iou_data:
-            hallu_preds_bin = hallu_preds_raw > best_threshold
+            hallu_preds_bin = hallu_preds_raw > best_iou_threshold
             for si in range(len(hallu_preds_bin)):
+                if len(span_debug) >= 20: break
                 ts = token_starts_list[si] if si < len(token_starts_list) else []
                 resp_len = len(response_texts[si]) if si < len(response_texts) else 0
-                # Filter to assistant tokens only (align with token_starts)
                 preds_asst = hallu_preds_bin[si][asst_mask[si]] if si < len(asst_mask) else hallu_preds_bin[si]
                 golds_asst = hallu_gold[si][asst_mask[si]] if si < len(asst_mask) else hallu_gold[si]
-                pred_spans = []
-                gold_spans = []
+                pred_spans, gold_spans = [], []
                 for arr, spans in [(preds_asst, pred_spans), (golds_asst, gold_spans)]:
-                    in_span = False
-                    span_start = 0
+                    in_span = False; span_start = 0
                     for j in range(min(len(ts), len(arr))):
-                        if arr[j] and not in_span:
-                            span_start = ts[j]
-                            in_span = True
-                        elif not arr[j] and in_span:
-                            spans.append((span_start, ts[j] if j < len(ts) else resp_len))
-                            in_span = False
-                    if in_span:
-                        spans.append((span_start, resp_len))
-                pred_set = set()
-                gold_set = set()
-                for s, e in pred_spans:
-                    pred_set.update(range(s, e))
-                for s, e in gold_spans:
-                    gold_set.update(range(s, e))
-                inter = len(pred_set & gold_set)
-                union = len(pred_set | gold_set)
-                if union > 0:
-                    span_ious.append(inter / union)
-                if len(span_debug) < 20:
-                    span_debug.append({
-                        "response": response_texts[si][:300] if si < len(response_texts) else "",
-                        "gold_spans": [[s, e] for s, e in gold_spans],
-                        "pred_spans": [[s, e] for s, e in pred_spans],
-                        "iou": inter / union if union > 0 else 0,
-                        "tok_pred_hallu": int(sum(preds_asst)) if len(preds_asst) > 0 else 0,
-                        "tok_gold_hallu": int(sum(golds_asst)) if len(golds_asst) > 0 else 0,
-                    })
-        span_iou = float(np.mean(span_ious)) if span_ious else 0.0
+                        if arr[j] and not in_span: span_start = ts[j]; in_span = True
+                        elif not arr[j] and in_span: spans.append((span_start, ts[j] if j < len(ts) else resp_len)); in_span = False
+                    if in_span: spans.append((span_start, resp_len))
+                pred_set = set(); gold_set = set()
+                for s, e in pred_spans: pred_set.update(range(s, e))
+                for s, e in gold_spans: gold_set.update(range(s, e))
+                inter = len(pred_set & gold_set); union = len(pred_set | gold_set)
+                span_debug.append({
+                    "response": response_texts[si][:300] if si < len(response_texts) else "",
+                    "gold_spans": [[s, e] for s, e in gold_spans],
+                    "pred_spans": [[s, e] for s, e in pred_spans],
+                    "iou": inter / union if union > 0 else 0,
+                    "tok_pred_hallu": int(sum(preds_asst)),
+                    "tok_gold_hallu": int(sum(golds_asst)),
+                })
+            if len(span_debug) >= 20: break
         # Calibration: Pearson correlation between predicted prob and annotator agreement prob
         calib_corr = 0.0
         if len(all_calib_preds) > 1:
@@ -1016,6 +1045,7 @@ if USE_MLP:
             "pr_auc": float(total_pr_auc),
             "best_threshold": float(best_threshold),
             "span_iou": float(span_iou),
+            "best_iou_threshold": float(best_iou_threshold),
             "calib_corr": float(calib_corr),
             "class_roc": class_roc,
             "span_debug": span_debug,
