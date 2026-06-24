@@ -907,7 +907,7 @@ if USE_MLP:
                 # Span IoU data collection (computed after loop with best_threshold)
                 hallu_preds_raw = torch.sigmoid(hallu_logits).cpu().numpy()
                 hallu_gold = (hallu_labels.cpu().numpy() > 0.5)
-                all_iou_data.append((hallu_preds_raw, hallu_gold, token_starts_list, response_texts))
+                all_iou_data.append((hallu_preds_raw, hallu_gold, token_starts_list, response_texts, (hallu_labels.cpu().numpy() >= -0.1)))
                 # Multi-class ROC: collect per-class probs and labels
                 if cat_logits is not None and "cat_labels" in batch:
                     cm = batch["cat_labels"] >= 0
@@ -939,14 +939,17 @@ if USE_MLP:
 
         # Span IoU (character-level) — using best_threshold from ROC
         span_ious = []
-        for hallu_preds_raw, hallu_gold, token_starts_list, response_texts in all_iou_data:
+        for hallu_preds_raw, hallu_gold, token_starts_list, response_texts, asst_mask in all_iou_data:
             hallu_preds_bin = hallu_preds_raw > best_threshold
             for si in range(len(hallu_preds_bin)):
                 ts = token_starts_list[si] if si < len(token_starts_list) else []
                 resp_len = len(response_texts[si]) if si < len(response_texts) else 0
+                # Filter to assistant tokens only (align with token_starts)
+                preds_asst = hallu_preds_bin[si][asst_mask[si]] if si < len(asst_mask) else hallu_preds_bin[si]
+                golds_asst = hallu_gold[si][asst_mask[si]] if si < len(asst_mask) else hallu_gold[si]
                 pred_spans = []
                 gold_spans = []
-                for arr, spans in [(hallu_preds_bin[si], pred_spans), (hallu_gold[si], gold_spans)]:
+                for arr, spans in [(preds_asst, pred_spans), (golds_asst, gold_spans)]:
                     in_span = False
                     span_start = 0
                     for j in range(min(len(ts), len(arr))):
