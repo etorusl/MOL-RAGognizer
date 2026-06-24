@@ -849,10 +849,9 @@ if USE_MLP:
         all_labels = []
         all_calib_preds = []
         all_calib_golds = []
-        all_char_spans_pred = []
-        all_char_spans_gold = []
         all_cat_probs_by_class = {i: [] for i in range(5)}
         all_cat_labels_by_class = {i: [] for i in range(5)}
+        all_iou_data = []  # (hallu_preds, hallu_gold, token_starts_list, response_texts) per batch
         total_lm_loss = 0.0
         total_hallu_loss = 0.0
         num_batches = 0
@@ -905,39 +904,10 @@ if USE_MLP:
                     if tmask.any():
                         all_calib_preds.extend(torch.sigmoid(hallu_logits[tmask]).cpu().tolist())
                         all_calib_golds.extend(batch["token_prob"][tmask].cpu().tolist())
-                # Span IoU: convert token preds to character spans
-                hallu_preds = (torch.sigmoid(hallu_logits) > 0.5).cpu().numpy()
+                # Span IoU data collection (computed after loop with best_threshold)
+                hallu_preds_raw = torch.sigmoid(hallu_logits).cpu().numpy()
                 hallu_gold = (hallu_labels.cpu().numpy() > 0.5)
-                for si in range(len(hallu_preds)):
-                    ts = token_starts_list[si] if si < len(token_starts_list) else []
-                    resp_len = len(response_texts[si]) if si < len(response_texts) else 0
-                    # Tokens → character spans
-                    n_tokens = hallu_preds[si].shape[0] - sum(hallu_labels[si].cpu().numpy() < -0.5)  # count non-masked
-                    pred_spans = []
-                    gold_spans = []
-                    for arr, spans in [(hallu_preds[si], pred_spans), (hallu_gold[si], gold_spans)]:
-                        in_span = False
-                        span_start = 0
-                        for j in range(min(len(ts), len(arr))):
-                            if arr[j] and not in_span:
-                                span_start = ts[j]
-                                in_span = True
-                            elif not arr[j] and in_span:
-                                spans.append((span_start, ts[j] if j < len(ts) else resp_len))
-                                in_span = False
-                        if in_span:
-                            spans.append((span_start, resp_len))
-                    # Compute IoU on character sets
-                    pred_set = set()
-                    gold_set = set()
-                    for s, e in pred_spans:
-                        pred_set.update(range(s, e))
-                    for s, e in gold_spans:
-                        gold_set.update(range(s, e))
-                    inter = len(pred_set & gold_set)
-                    union = len(pred_set | gold_set)
-                    if union > 0:
-                        all_char_spans_pred.append(inter / union)
+                all_iou_data.append((hallu_preds_raw, hallu_gold, token_starts_list, response_texts))
                 # Multi-class ROC: collect per-class probs and labels
                 if cat_logits is not None and "cat_labels" in batch:
                     cm = batch["cat_labels"] >= 0
@@ -967,8 +937,38 @@ if USE_MLP:
         fpr, tpr, thresholds = roc_curve(all_labels_np, all_probs_np)
         best_threshold = thresholds[np.argmax(tpr - fpr)]
 
-        # Span IoU (character-level)
-        span_iou = float(np.mean(all_char_spans_pred)) if all_char_spans_pred else 0.5
+        # Span IoU (character-level) — using best_threshold from ROC
+        span_ious = []
+        for hallu_preds_raw, hallu_gold, token_starts_list, response_texts in all_iou_data:
+            hallu_preds_bin = hallu_preds_raw > best_threshold
+            for si in range(len(hallu_preds_bin)):
+                ts = token_starts_list[si] if si < len(token_starts_list) else []
+                resp_len = len(response_texts[si]) if si < len(response_texts) else 0
+                pred_spans = []
+                gold_spans = []
+                for arr, spans in [(hallu_preds_bin[si], pred_spans), (hallu_gold[si], gold_spans)]:
+                    in_span = False
+                    span_start = 0
+                    for j in range(min(len(ts), len(arr))):
+                        if arr[j] and not in_span:
+                            span_start = ts[j]
+                            in_span = True
+                        elif not arr[j] and in_span:
+                            spans.append((span_start, ts[j] if j < len(ts) else resp_len))
+                            in_span = False
+                    if in_span:
+                        spans.append((span_start, resp_len))
+                pred_set = set()
+                gold_set = set()
+                for s, e in pred_spans:
+                    pred_set.update(range(s, e))
+                for s, e in gold_spans:
+                    gold_set.update(range(s, e))
+                inter = len(pred_set & gold_set)
+                union = len(pred_set | gold_set)
+                if union > 0:
+                    span_ious.append(inter / union)
+        span_iou = float(np.mean(span_ious)) if span_ious else 0.0
         # Calibration: Pearson correlation between predicted prob and annotator agreement prob
         calib_corr = 0.0
         if len(all_calib_preds) > 1:
