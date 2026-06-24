@@ -565,6 +565,7 @@ if USE_MLP:
     import torch.nn.functional as F
     from ragognizer.detectors.RAGognizer import LayerAggregator, MLP
     from torch.optim import AdamW
+    from scipy.stats import pearsonr
 
     quantization_config_mlp = None
     if QUANTIZED:
@@ -723,6 +724,24 @@ if USE_MLP:
                 np.full(len(full_ids) - len(label_per_token), -1.0),
                 label_per_token.astype(float)
             ]).tolist()
+            # Token-level gold probability from annotator agreement (for calibration)
+            token_prob = np.zeros(len(token_starts))
+            for lbl in item.get("labels_raw", []):
+                first = len(token_starts) - 1
+                try:
+                    while token_starts[first] > lbl["start"]: first -= 1
+                except Exception: first = 0
+                first = max(0, min(first, len(token_starts) - 1))
+                last = 0
+                try:
+                    while token_starts[last] < lbl["end"]: last += 1
+                except Exception: last = len(token_starts) - 1
+                last = max(0, min(last, len(token_starts) - 1))
+                token_prob[first:last] = np.maximum(token_prob[first:last], lbl["prob"])
+            token_prob_full = np.concatenate([
+                np.full(len(full_ids) - len(token_prob), -1.0),
+                token_prob
+            ]).tolist()
             cat_per_token_full = np.concatenate([
                 np.full(len(full_ids) - len(cat_per_token), -100, dtype=int),
                 cat_per_token
@@ -736,6 +755,9 @@ if USE_MLP:
                 "labels": torch.tensor(lbls, dtype=torch.long),
                 head_name: torch.tensor(hallu_per_token, dtype=torch.float32),
                 "cat_labels": torch.tensor(cat_per_token_full, dtype=torch.long),
+                "token_prob": torch.tensor(token_prob_full, dtype=torch.float32),
+                "response": response,
+                "token_starts": token_starts,  # char offset of each assistant token
                 "proc_inputs": {k: v for k, v in inputs.items() if k not in ("input_ids", "attention_mask")},
             }
 
@@ -747,6 +769,9 @@ if USE_MLP:
             labels = torch.full((B, max_len), -100, dtype=torch.long)
             hallu = torch.full((B, max_len), -1.0)
             cat_lbls = torch.full((B, max_len), -100, dtype=torch.long)
+            tok_prob = torch.full((B, max_len), -1.0)
+            response_texts = []
+            token_starts_list = []
             proc_lists = {}
             for i, b in enumerate(batch):
                 L = b["input_ids"].size(0)
@@ -755,10 +780,13 @@ if USE_MLP:
                 labels[i, :L] = b["labels"]
                 hallu[i, :L] = b[head_name]
                 cat_lbls[i, :L] = b["cat_labels"]
+                tok_prob[i, :L] = b["token_prob"]
+                response_texts.append(b.get("response", ""))
+                token_starts_list.append(b.get("token_starts", []))
                 for pk, pv in b.get("proc_inputs", {}).items():
                     if pv is not None:
                         proc_lists.setdefault(pk, []).append(pv)
-            d = {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels, head_name: hallu, "cat_labels": cat_lbls}
+            d = {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels, head_name: hallu, "cat_labels": cat_lbls, "token_prob": tok_prob, "response_texts": response_texts, "token_starts": token_starts_list}
             for pk, plist in proc_lists.items():
                 if plist:
                     d[pk] = torch.cat(plist, dim=0)
@@ -819,12 +847,18 @@ if USE_MLP:
 
         all_probs = []
         all_labels = []
+        all_calib_preds = []
+        all_calib_golds = []
+        all_char_spans_pred = []
+        all_char_spans_gold = []
         total_lm_loss = 0.0
         total_hallu_loss = 0.0
         num_batches = 0
 
         for batch in tqdm(loader, desc="Evaluating"):
-            batch = {k: v.to("cuda") for k, v in batch.items()}
+            response_texts = batch.pop("response_texts", [""] * len(batch.get("labels", [""])))
+            token_starts_list = batch.pop("token_starts", [[]] * len(batch.get("labels", [""])))
+            batch = {k: v.to("cuda") for k, v in batch.items() if isinstance(v, torch.Tensor)}
             with torch.no_grad():
                 model_kwargs = {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"], "output_hidden_states": True}
                 for k, v in batch.items():
@@ -863,6 +897,45 @@ if USE_MLP:
                 labels_np = hallu_labels[mask].cpu().numpy()
                 all_probs.extend(probs.tolist())
                 all_labels.extend(labels_np.tolist())
+                # Calibration data: predicted vs gold probability per hallucinated token
+                if "token_prob" in batch:
+                    tmask = batch["token_prob"] >= 0
+                    if tmask.any():
+                        all_calib_preds.extend(torch.sigmoid(hallu_logits[tmask]).cpu().tolist())
+                        all_calib_golds.extend(batch["token_prob"][tmask].cpu().tolist())
+                # Span IoU: convert token preds to character spans
+                hallu_preds = (torch.sigmoid(hallu_logits) > 0.5).cpu().numpy()
+                hallu_gold = (hallu_labels.cpu().numpy() > 0.5)
+                for si in range(len(hallu_preds)):
+                    ts = token_starts_list[si] if si < len(token_starts_list) else []
+                    resp_len = len(response_texts[si]) if si < len(response_texts) else 0
+                    # Tokens → character spans
+                    n_tokens = hallu_preds[si].shape[0] - sum(hallu_labels[si].cpu().numpy() < -0.5)  # count non-masked
+                    pred_spans = []
+                    gold_spans = []
+                    for arr, spans in [(hallu_preds[si], pred_spans), (hallu_gold[si], gold_spans)]:
+                        in_span = False
+                        span_start = 0
+                        for j in range(min(len(ts), len(arr))):
+                            if arr[j] and not in_span:
+                                span_start = ts[j]
+                                in_span = True
+                            elif not arr[j] and in_span:
+                                spans.append((span_start, ts[j] if j < len(ts) else resp_len))
+                                in_span = False
+                        if in_span:
+                            spans.append((span_start, resp_len))
+                    # Compute IoU on character sets
+                    pred_set = set()
+                    gold_set = set()
+                    for s, e in pred_spans:
+                        pred_set.update(range(s, e))
+                    for s, e in gold_spans:
+                        gold_set.update(range(s, e))
+                    inter = len(pred_set & gold_set)
+                    union = len(pred_set | gold_set)
+                    if union > 0:
+                        all_char_spans_pred.append(inter / union)
                 total_lm_loss += lm_loss.item()
                 total_hallu_loss += hallu_loss.item() + cat_loss.item()
                 num_batches += 1
@@ -883,11 +956,23 @@ if USE_MLP:
         fpr, tpr, thresholds = roc_curve(all_labels_np, all_probs_np)
         best_threshold = thresholds[np.argmax(tpr - fpr)]
 
+        # Span IoU (character-level)
+        span_iou = float(np.mean(all_char_spans_pred)) if all_char_spans_pred else 0.5
+        # Calibration: Pearson correlation between predicted prob and annotator agreement prob
+        calib_corr = 0.0
+        if len(all_calib_preds) > 1:
+            try:
+                calib_corr, _ = pearsonr(all_calib_golds, all_calib_preds)
+            except Exception:
+                calib_corr = 0.0
+
         return {
             "loss": (total_lm_loss + total_hallu_loss) / max(num_batches, 1),
             "roc_auc": float(total_roc_auc),
             "pr_auc": float(total_pr_auc),
             "best_threshold": float(best_threshold),
+            "span_iou": float(span_iou),
+            "calib_corr": float(calib_corr),
         }
 
     training_loss_history = pd.Series()
