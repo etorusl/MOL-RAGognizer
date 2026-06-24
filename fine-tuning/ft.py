@@ -48,6 +48,9 @@ parser.add_argument("--mlp_hidden_dims", type=str, default="1024,512", help="Com
 parser.add_argument("--multimodal", action="store_true", help="Use multimodal dataset (shroom-vision) instead of RAGognize")
 parser.add_argument("--image_dir", type=str, default="./images/shroom", help="Directory containing images referenced by dataset")
 parser.add_argument("--lang", type=str, default="all", help="Language filter for multimodal: en, fr, it, zh, or all (default)")
+parser.add_argument("--fake", action="store_true", help="Use shuffled (fake) image-name mapping to test if model relies on images")
+parser.add_argument("--min_span_chars", type=int, default=8, help="Min span length in chars (0 to disable filter)")
+parser.add_argument("--gap_chars", type=int, default=12, help="Max gap between spans to merge (0 to disable merge)")
 args = parser.parse_args()
 
 EVAL_PERC = 0.15 # For RAGTruth
@@ -67,6 +70,8 @@ MLP_HIDDEN_DIMS = [int(x) for x in args.mlp_hidden_dims.split(",")]
 USE_MULTIMODAL = args.multimodal
 IMAGE_DIR = args.image_dir
 LANG = args.lang
+MIN_SPAN_CHARS = args.min_span_chars
+GAP_CHARS = args.gap_chars
 
 PAD_TOKEN = {
     "meta-llama/Llama-2-7b-chat-hf": "<pad>",
@@ -434,9 +439,11 @@ def formatted_ragtruth(get_test: bool=False, eval_perc: float=None):
         return Dataset.from_list(train_entries), Dataset.from_list(val_entries)
 
 
-def formatted_multimodal(dataset_dir, image_dir, lang):
+def formatted_multimodal(dataset_dir, image_dir, lang, fake=False):
     import glob
-    if lang == "all":
+    if fake:
+        pattern = "*.en.fake.jsonl" if lang in ("en", "all") else f"*.{lang}.fake.jsonl"
+    elif lang == "all":
         pattern = "*.labeled.jsonl"
     else:
         pattern = f"*.{lang}.labeled.jsonl"
@@ -494,7 +501,7 @@ def formatted_multimodal(dataset_dir, image_dir, lang):
 
 if USE_MULTIMODAL:
     train_dataset, val_dataset = formatted_multimodal(
-        args.dataset, IMAGE_DIR, LANG
+        args.dataset, IMAGE_DIR, LANG, args.fake
     )
     test_dataset = val_dataset
 elif USE_RAGTRUTH:
@@ -972,12 +979,12 @@ if USE_MLP:
                             elif not arr[j] and in_span:
                                 spans.append((span_start, ts[j] if j < len(ts) else resp_len))
                                 in_span = False
-                        if in_span:
-                            spans.append((span_start, resp_len))
-                    # Post-process predictions: filter short spans, merge nearby gaps
-                    MIN_SPAN_CHARS = 8
-                    GAP_CHARS = 12
+                    if in_span:
+                        spans.append((span_start, resp_len))
+                # Post-process predictions: filter short spans, merge nearby gaps
+                if MIN_SPAN_CHARS > 0:
                     pred_spans = [s for s in pred_spans if s[1] - s[0] >= MIN_SPAN_CHARS]
+                if GAP_CHARS > 0:
                     merged = []
                     for s in sorted(pred_spans):
                         if merged and s[0] - merged[-1][1] <= GAP_CHARS:
@@ -985,7 +992,7 @@ if USE_MLP:
                         else:
                             merged.append(s)
                     pred_spans = merged
-                    pred_set = set()
+                pred_set = set()
                     gold_set = set()
                     for s, e in pred_spans: pred_set.update(range(s, e))
                     for s, e in gold_spans: gold_set.update(range(s, e))
@@ -1014,14 +1021,16 @@ if USE_MLP:
                         if arr[j] and not in_span: span_start = ts[j]; in_span = True
                         elif not arr[j] and in_span: spans.append((span_start, ts[j] if j < len(ts) else resp_len)); in_span = False
                     if in_span: spans.append((span_start, resp_len))
-                pred_spans = [s for s in pred_spans if s[1] - s[0] >= 8]
-                merged = []
-                for s in sorted(pred_spans):
-                    if merged and s[0] - merged[-1][1] <= 12:
-                        merged[-1] = (merged[-1][0], s[1])
-                    else:
-                        merged.append(s)
-                pred_spans = merged
+                if MIN_SPAN_CHARS > 0:
+                    pred_spans = [s for s in pred_spans if s[1] - s[0] >= MIN_SPAN_CHARS]
+                if GAP_CHARS > 0:
+                    merged = []
+                    for s in sorted(pred_spans):
+                        if merged and s[0] - merged[-1][1] <= GAP_CHARS:
+                            merged[-1] = (merged[-1][0], s[1])
+                        else:
+                            merged.append(s)
+                    pred_spans = merged
                 pred_set = set(); gold_set = set()
                 for s, e in pred_spans: pred_set.update(range(s, e))
                 for s, e in gold_spans: gold_set.update(range(s, e))
