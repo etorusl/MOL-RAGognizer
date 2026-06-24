@@ -980,16 +980,22 @@ if USE_MLP:
         # Per-class ROC (one-vs-rest)
         CAT_NAMES = ["invention", "mischaracterization", "OCR", "miscounting", "other"]
         class_roc = {}
+        roc_values = []
         for ci in range(5):
             l = all_cat_labels_by_class[ci]
             p = all_cat_probs_by_class[ci]
             if len(l) > 0 and len(set(l)) > 1:
                 try:
-                    class_roc[CAT_NAMES[ci]] = float(roc_auc_score(l, p))
+                    v = float(roc_auc_score(l, p))
+                    class_roc[CAT_NAMES[ci]] = v
+                    roc_values.append(v)
                 except Exception:
                     class_roc[CAT_NAMES[ci]] = 0.5
+                    roc_values.append(0.5)
             else:
                 class_roc[CAT_NAMES[ci]] = 0.5
+                roc_values.append(0.5)
+        class_roc["macro_avg"] = float(np.mean(roc_values)) if roc_values else 0.5
 
         return {
             "loss": (total_lm_loss + total_hallu_loss) / max(num_batches, 1),
