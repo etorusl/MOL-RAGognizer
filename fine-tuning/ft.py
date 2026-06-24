@@ -939,6 +939,7 @@ if USE_MLP:
 
         # Span IoU (character-level) — using best_threshold from ROC
         span_ious = []
+        span_debug = []  # per-sample debug data
         for hallu_preds_raw, hallu_gold, token_starts_list, response_texts, asst_mask in all_iou_data:
             hallu_preds_bin = hallu_preds_raw > best_threshold
             for si in range(len(hallu_preds_bin)):
@@ -971,6 +972,15 @@ if USE_MLP:
                 union = len(pred_set | gold_set)
                 if union > 0:
                     span_ious.append(inter / union)
+                if len(span_debug) < 20:
+                    span_debug.append({
+                        "response": response_texts[si][:300] if si < len(response_texts) else "",
+                        "gold_spans": [[s, e] for s, e in gold_spans],
+                        "pred_spans": [[s, e] for s, e in pred_spans],
+                        "iou": inter / union if union > 0 else 0,
+                        "tok_pred_hallu": int(sum(preds_asst)) if len(preds_asst) > 0 else 0,
+                        "tok_gold_hallu": int(sum(golds_asst)) if len(golds_asst) > 0 else 0,
+                    })
         span_iou = float(np.mean(span_ious)) if span_ious else 0.0
         # Calibration: Pearson correlation between predicted prob and annotator agreement prob
         calib_corr = 0.0
@@ -1008,6 +1018,7 @@ if USE_MLP:
             "span_iou": float(span_iou),
             "calib_corr": float(calib_corr),
             "class_roc": class_roc,
+            "span_debug": span_debug,
         }
 
     training_loss_history = pd.Series()
@@ -1021,6 +1032,11 @@ if USE_MLP:
     eval_loss_history[0] = eval_res["loss"]
     eval_auroc_history[0] = eval_res["roc_auc"]
     eval_auprc_history[0] = eval_res["pr_auc"]
+
+    span_debug_dir = os.path.join(OUTPUT_DIR, "plots")
+    os.makedirs(span_debug_dir, exist_ok=True)
+    with open(os.path.join(span_debug_dir, "span_debug_epoch0.json"), "w") as f:
+        json.dump(eval_res.pop("span_debug", []), f, ensure_ascii=False, indent=2)
 
     for epoch in range(EPOCHS):
         llm_model.train()
@@ -1090,6 +1106,12 @@ if USE_MLP:
         eval_loss_history[epoch + 1] = eval_res["loss"]
         eval_auroc_history[epoch + 1] = eval_res["roc_auc"]
         eval_auprc_history[epoch + 1] = eval_res["pr_auc"]
+
+        # Save span debug JSON for manual inspection
+        span_debug_dir = os.path.join(OUTPUT_DIR, "plots")
+        os.makedirs(span_debug_dir, exist_ok=True)
+        with open(os.path.join(span_debug_dir, f"span_debug_epoch{epoch+1}.json"), "w") as f:
+            json.dump(eval_res.pop("span_debug", []), f, ensure_ascii=False, indent=2)
 
         save_dir = os.path.join(OUTPUT_DIR, f"checkpoint_{epoch+1}")
         os.makedirs(save_dir, exist_ok=True)
