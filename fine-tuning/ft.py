@@ -929,7 +929,7 @@ if USE_MLP:
             return {
                 "loss": (total_lm_loss + total_hallu_loss) / max(num_batches, 1),
                 "roc_auc": 0.5, "pr_auc": 0.0, "best_threshold": 0.5,
-                "span_iou": 0.0, "best_iou_threshold": 0.5, "calib_corr": 0.0,
+                "span_iou": 0.0, "best_iou_threshold": 0.5, "iou_by_threshold": {}, "calib_corr": 0.0,
                 "class_roc": {}, "span_debug": [],
             }
         total_roc_auc = roc_auc_score(all_labels_np, all_probs_np)
@@ -942,6 +942,7 @@ if USE_MLP:
         best_iou_threshold = 0.5
         span_debug = []
         thresholds_to_try = sorted(set([0.3, 0.4, 0.5, 0.6, 0.7] + [round(best_threshold, 2)]))
+        iou_by_threshold = {}
         for thr in thresholds_to_try:
             span_ious_thr = []
             debug_thr = []
@@ -976,12 +977,10 @@ if USE_MLP:
                     if union > 0:
                         span_ious_thr.append(inter / union)
             mean_iou = float(np.mean(span_ious_thr)) if span_ious_thr else 0.0
+            iou_by_threshold[thr] = mean_iou
             if mean_iou >= span_iou:
                 span_iou = mean_iou
                 best_iou_threshold = thr
-                if thr == thresholds_to_try[-1] or mean_iou > 0:
-                    span_debug = []  # fill debug only for best threshold
-                    # Recompute with best threshold (already done — span_debug is empty, just note the threshold)
         # Rebuild span_debug with best threshold
         for hallu_preds_raw, hallu_gold, token_starts_list, response_texts, asst_mask in all_iou_data:
             hallu_preds_bin = hallu_preds_raw > best_iou_threshold
@@ -1046,6 +1045,7 @@ if USE_MLP:
             "best_threshold": float(best_threshold),
             "span_iou": float(span_iou),
             "best_iou_threshold": float(best_iou_threshold),
+            "iou_by_threshold": {str(k): v for k, v in iou_by_threshold.items()},
             "calib_corr": float(calib_corr),
             "class_roc": class_roc,
             "span_debug": span_debug,
