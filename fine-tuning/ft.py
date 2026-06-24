@@ -875,8 +875,8 @@ if USE_MLP:
                 hidden_states = torch.stack(outputs.hidden_states, dim=1)
                 aggregated = layer_aggregator(hidden_states)
                 hallu_logits_all = mlp(aggregated)
-                hallu_logits = hallu_logits_all[:, 0]
-                cat_logits = hallu_logits_all[:, 1:] if hallu_logits_all.size(1) > 1 else None
+                hallu_logits = hallu_logits_all[..., 0]
+                cat_logits = hallu_logits_all[..., 1:] if hallu_logits_all.size(-1) > 1 else None
                 hallu_labels = batch[head_name]
                 mask = hallu_labels >= -0.1
                 if mask.any():
@@ -1014,8 +1014,8 @@ if USE_MLP:
             hidden_states = torch.stack(outputs.hidden_states, dim=1)
             aggregated = layer_aggregator(hidden_states)
             hallu_logits_all = mlp(aggregated)
-            hallu_logits = hallu_logits_all[:, 0]
-            cat_logits = hallu_logits_all[:, 1:] if hallu_logits_all.size(1) > 1 else None
+            hallu_logits = hallu_logits_all[..., 0]
+            cat_logits = hallu_logits_all[..., 1:] if hallu_logits_all.size(-1) > 1 else None
             hallu_labels = batch[head_name]
             mask = hallu_labels >= -0.1
             if mask.any():
