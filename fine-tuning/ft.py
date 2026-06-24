@@ -541,11 +541,17 @@ if not USE_MLP:
 zeros = 0
 ones = 0
 if BALANCED:
-    for ten in train_dataset[head_name]:
-        arr = np.array(ten) if isinstance(ten, list) else ten.numpy()
-        zeros += int((arr == 0).sum())
-        ones += int((arr == 1).sum())
-
+    if USE_MULTIMODAL:
+        for item in train_dataset:
+            if item.get("labels_raw", []):
+                ones += 1
+            else:
+                zeros += 1
+    else:
+        for ten in train_dataset[head_name]:
+            arr = np.array(ten) if isinstance(ten, list) else ten.numpy()
+            zeros += int((arr == 0).sum())
+            ones += int((arr == 1).sum())
     ones_weight = 1 / (ones / (zeros + ones)) if (zeros + ones) > 0 else 1.0
 else:
     ones_weight = 1.0
