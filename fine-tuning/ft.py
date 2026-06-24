@@ -851,6 +851,8 @@ if USE_MLP:
         all_calib_golds = []
         all_char_spans_pred = []
         all_char_spans_gold = []
+        all_cat_probs_by_class = {i: [] for i in range(5)}
+        all_cat_labels_by_class = {i: [] for i in range(5)}
         total_lm_loss = 0.0
         total_hallu_loss = 0.0
         num_batches = 0
@@ -936,6 +938,15 @@ if USE_MLP:
                     union = len(pred_set | gold_set)
                     if union > 0:
                         all_char_spans_pred.append(inter / union)
+                # Multi-class ROC: collect per-class probs and labels
+                if cat_logits is not None and "cat_labels" in batch:
+                    cm = batch["cat_labels"] >= 0
+                    if cm.any():
+                        cprobs = torch.softmax(cat_logits[cm], dim=-1).cpu().numpy()
+                        clabels = batch["cat_labels"][cm].cpu().numpy().astype(int)
+                        for ci in range(5):
+                            all_cat_probs_by_class[ci].extend(cprobs[:, ci].tolist())
+                            all_cat_labels_by_class[ci].extend((clabels == ci).astype(int).tolist())
                 total_lm_loss += lm_loss.item()
                 total_hallu_loss += hallu_loss.item() + cat_loss.item()
                 num_batches += 1
@@ -966,6 +977,20 @@ if USE_MLP:
             except Exception:
                 calib_corr = 0.0
 
+        # Per-class ROC (one-vs-rest)
+        CAT_NAMES = ["invention", "mischaracterization", "OCR", "miscounting", "other"]
+        class_roc = {}
+        for ci in range(5):
+            l = all_cat_labels_by_class[ci]
+            p = all_cat_probs_by_class[ci]
+            if len(l) > 0 and len(set(l)) > 1:
+                try:
+                    class_roc[CAT_NAMES[ci]] = float(roc_auc_score(l, p))
+                except Exception:
+                    class_roc[CAT_NAMES[ci]] = 0.5
+            else:
+                class_roc[CAT_NAMES[ci]] = 0.5
+
         return {
             "loss": (total_lm_loss + total_hallu_loss) / max(num_batches, 1),
             "roc_auc": float(total_roc_auc),
@@ -973,6 +998,7 @@ if USE_MLP:
             "best_threshold": float(best_threshold),
             "span_iou": float(span_iou),
             "calib_corr": float(calib_corr),
+            "class_roc": class_roc,
         }
 
     training_loss_history = pd.Series()
