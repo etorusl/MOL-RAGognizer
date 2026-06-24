@@ -974,6 +974,17 @@ if USE_MLP:
                                 in_span = False
                         if in_span:
                             spans.append((span_start, resp_len))
+                    # Post-process predictions: filter short spans, merge nearby gaps
+                    MIN_SPAN_CHARS = 8
+                    GAP_CHARS = 12
+                    pred_spans = [s for s in pred_spans if s[1] - s[0] >= MIN_SPAN_CHARS]
+                    merged = []
+                    for s in sorted(pred_spans):
+                        if merged and s[0] - merged[-1][1] <= GAP_CHARS:
+                            merged[-1] = (merged[-1][0], s[1])
+                        else:
+                            merged.append(s)
+                    pred_spans = merged
                     pred_set = set()
                     gold_set = set()
                     for s, e in pred_spans: pred_set.update(range(s, e))
@@ -1003,6 +1014,14 @@ if USE_MLP:
                         if arr[j] and not in_span: span_start = ts[j]; in_span = True
                         elif not arr[j] and in_span: spans.append((span_start, ts[j] if j < len(ts) else resp_len)); in_span = False
                     if in_span: spans.append((span_start, resp_len))
+                pred_spans = [s for s in pred_spans if s[1] - s[0] >= 8]
+                merged = []
+                for s in sorted(pred_spans):
+                    if merged and s[0] - merged[-1][1] <= 12:
+                        merged[-1] = (merged[-1][0], s[1])
+                    else:
+                        merged.append(s)
+                pred_spans = merged
                 pred_set = set(); gold_set = set()
                 for s, e in pred_spans: pred_set.update(range(s, e))
                 for s, e in gold_spans: gold_set.update(range(s, e))
