@@ -49,6 +49,7 @@ parser.add_argument("--multimodal", action="store_true", help="Use multimodal da
 parser.add_argument("--image_dir", type=str, default="./images/shroom", help="Directory containing images referenced by dataset")
 parser.add_argument("--lang", type=str, default="all", help="Language filter for multimodal: en, fr, it, zh, or all (default)")
 parser.add_argument("--fake", action="store_true", help="Use shuffled (fake) image-name mapping to test if model relies on images")
+parser.add_argument("--no_image", action="store_true", help="Strip images entirely: text-only hallucination detection to test vision reliance")
 parser.add_argument("--min_span_chars", type=int, default=8, help="Min span length in chars (0 to disable filter)")
 parser.add_argument("--gap_chars", type=int, default=12, help="Max gap between spans to merge (0 to disable merge)")
 args = parser.parse_args()
@@ -70,6 +71,7 @@ MLP_HIDDEN_DIMS = [int(x) for x in args.mlp_hidden_dims.split(",")]
 USE_MULTIMODAL = args.multimodal
 IMAGE_DIR = args.image_dir
 LANG = args.lang
+NO_IMAGE = args.no_image
 MIN_SPAN_CHARS = args.min_span_chars
 GAP_CHARS = args.gap_chars
 
@@ -681,9 +683,10 @@ if USE_MLP:
             prompt_text = item["prompt"]
             image_path = item["image_path"]
             user_content = [
-                {"type": "image", "url": image_path},
                 {"type": "text", "text": prompt_text},
             ]
+            if not NO_IMAGE:
+                user_content.insert(0, {"type": "image", "url": image_path})
             full_msgs = [
                 {"role": "user", "content": user_content},
                 {"role": "assistant", "content": response},
