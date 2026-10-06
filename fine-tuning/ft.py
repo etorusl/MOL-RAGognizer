@@ -20,24 +20,16 @@ load_dotenv(find_dotenv()) # might require "HF_TOKEN" to be set in the .env file
 
 from ragognizer.benchmarks.RAGTruth import RAGTruth
 from datasets import load_dataset, Dataset, load_from_disk
-from transformers import AutoTokenizer, BitsAndBytesConfig, Lfm2Model, Qwen3Model, GraniteMoeHybridModel, Gemma3TextModel
+from transformers import AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig
 from argparse import ArgumentParser
 import matplotlib.pyplot as plt
 from trl import SFTTrainer, SFTConfig
 
-from transformer_heads.util.helpers import DataCollatorWithPadding, get_model_params
-from transformer_heads import create_headed_qlora
-from transformer_heads.config import HeadConfig
-from transformer_heads.util.model import print_trainable_parameters
-from transformer_heads.output import HeadedModelOutput
-from transformer_heads.constants import model_type_map
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from sklearn.metrics import average_precision_score, roc_curve, roc_auc_score
-
-from transformer_heads.constants import loss_fct_map
 
 parser = ArgumentParser()
 parser.add_argument("model")
@@ -51,6 +43,8 @@ parser.add_argument("--ragtruth", action="store_true")
 parser.add_argument("--nolmhead", action="store_true")
 parser.add_argument("--headatend", action="store_true")
 parser.add_argument("--quantized", action="store_true")
+parser.add_argument("--mlp", action="store_true", help="Use separate MLP + LayerAggregator instead of transformer-heads")
+parser.add_argument("--mlp_hidden_dims", type=str, default="1024,512", help="Comma-separated MLP hidden dimensions")
 args = parser.parse_args()
 
 EVAL_PERC = 0.15 # For RAGTruth
@@ -65,6 +59,8 @@ USE_RAGTRUTH = args.ragtruth
 NO_LM_HEAD = args.nolmhead
 HEAD_AT_END = args.headatend
 QUANTIZED = args.quantized
+USE_MLP = args.mlp
+MLP_HIDDEN_DIMS = [int(x) for x in args.mlp_hidden_dims.split(",")]
 
 PAD_TOKEN = {
     "meta-llama/Llama-2-7b-chat-hf": "<pad>",
@@ -75,26 +71,13 @@ PAD_TOKEN = {
     "meta-llama/Llama-3.2-1B-Instruct": "<|reserved_special_token_0|>",
 }.get(MODEL_NAME, None)
 
-model_params = get_model_params(MODEL_NAME)
-model_class = model_params["model_class"]
-hidden_size = model_params["hidden_size"]
-vocab_size = model_params["vocab_size"]
-
-head_perc = 0.5
-layer_hook = int(model_params["num_hidden_layers"] * head_perc)
-if HEAD_AT_END:
-    layer_hook = 1 # Last layer
-head_name = f"hallu_head_neg_{layer_hook}"
+hidden_size = None  # set later: MLP mode from model config, transformer-heads mode from get_model_params
+head_name = "hallu_labels"
 
 CURR_DIR = os.path.dirname(os.path.realpath(__file__))
 DATA_DIR = os.path.join(CURR_DIR, "..", "ragognize", "data")
 OUTPUT_DIR = os.path.join(CURR_DIR, OUTNAME, MODEL_NAME.split("/")[-1])
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-model_type_map["qwen3"] = ("model", Qwen3Model)
-model_type_map["lfm2"] = ("model", Lfm2Model)
-model_type_map["granitemoehybrid"] = ("model", GraniteMoeHybridModel)
-model_type_map["gemma3_text"] = ("model", Gemma3TextModel)
 
 # if PAD_TOKEN is None:
 #     raise Exception("Padding token is None! Please, set add an appropiate pad_token.")
@@ -439,6 +422,13 @@ else:
     val_dataset   = split_dataset["test"]
     test_dataset  = formatted_dataset(dataset["test"])
 
+if len(train_dataset) == 0:
+    model_short = MODEL_NAME.split("/", 1)[1]
+    raise ValueError(
+        f"Empty dataset! Model '{model_short}' has no responses in the dataset. "
+        f"Use --allentries to train on all available responses, or switch to a model that exists in the dataset."
+    )
+
 train_dataset.set_format(
     type="torch",
     columns=["input_ids", "attention_mask", head_name, "labels"],
@@ -453,9 +443,9 @@ test_dataset.set_format(
 )
 
 # Calculcate weight for hallucinated tokens (to account for imbalance)
+zeros = 0
+ones = 0
 if BALANCED:
-    zeros = 0
-    ones = 0
     for ten in train_dataset[head_name]:
         zeros += (ten == 0).sum().item()
         ones += (ten == 1).sum().item()
@@ -472,6 +462,300 @@ print("Ones Weight:", ones_weight)
 print(train_dataset)
 print(val_dataset)
 print(test_dataset)
+
+if USE_MLP:
+    from transformers import AutoModelForCausalLM
+    from peft import get_peft_model
+    import torch.nn.functional as F
+    from ragognizer.detectors.RAGognizer import LayerAggregator, MLP
+    from torch.optim import AdamW
+
+    quantization_config_mlp = None
+    if QUANTIZED:
+        quantization_config_mlp = BitsAndBytesConfig(load_in_8bit=True)
+
+    lora_config_mlp = LoraConfig(
+        r=32,
+        lora_alpha=16,
+        target_modules=None,
+        lora_dropout=0.0,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+
+    llm_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        quantization_config=quantization_config_mlp,
+        device_map={"": torch.cuda.current_device()},
+        torch_dtype=torch.bfloat16,
+    )
+    llm_model = get_peft_model(llm_model, lora_config_mlp)
+
+    if tokenizer.pad_token is None and PAD_TOKEN:
+        tokenizer.add_special_tokens({"pad_token": PAD_TOKEN})
+        llm_model.config.pad_token_id = tokenizer.pad_token_id
+        tokenizer.padding_side = "right"
+        if "reserved" not in PAD_TOKEN:
+            llm_model.resize_token_embeddings(len(tokenizer))
+
+    num_layers = llm_model.config.num_hidden_layers + 1
+    hidden_size = llm_model.config.hidden_size
+    layer_aggregator = LayerAggregator(num_layers).to("cuda")
+    mlp = MLP(input_size=hidden_size, hidden_dims=MLP_HIDDEN_DIMS).to("cuda")
+
+    optimizer = AdamW([
+        {"params": [p for n, p in llm_model.named_parameters() if p.requires_grad], "lr": 4e-5},
+        {"params": layer_aggregator.parameters(), "lr": 4e-5},
+        {"params": mlp.parameters(), "lr": 4e-5},
+    ])
+
+    def collate_mlp(batch):
+        max_len = max(len(item["input_ids"]) for item in batch)
+        padded = {}
+        for key in ["input_ids", "attention_mask", "labels"]:
+            pad_val = tokenizer.pad_token_id if key == "input_ids" else (0 if key == "attention_mask" else -100)
+            tensors = []
+            for item in batch:
+                t = torch.tensor(item[key], dtype=torch.long)
+                if len(t) < max_len:
+                    t = torch.cat([t, torch.full((max_len - len(t),), pad_val, dtype=torch.long)])
+                tensors.append(t)
+            padded[key] = torch.stack(tensors)
+        hallu_tensors = []
+        for item in batch:
+            h = torch.tensor([v[0] for v in item[head_name]], dtype=torch.float32)
+            if len(h) < max_len:
+                h = torch.cat([h, torch.full((max_len - len(h),), -1.0)])
+            hallu_tensors.append(h)
+        padded[head_name] = torch.stack(hallu_tensors)
+        return padded
+
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, collate_fn=collate_mlp)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=collate_mlp)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=collate_mlp)
+
+    GRAD_ACCUM = 8
+    SCALE_FACTOR = GRAD_ACCUM
+    pos_weight_tensor = torch.tensor([ones_weight]).to("cuda") if BALANCED else None
+
+    def eval_mlp(is_val=True):
+        llm_model.eval()
+        layer_aggregator.eval()
+        mlp.eval()
+        loader = val_loader if is_val else test_loader
+
+        all_probs = []
+        all_labels = []
+        total_lm_loss = 0.0
+        total_hallu_loss = 0.0
+        num_batches = 0
+
+        for batch in tqdm(loader, desc="Evaluating"):
+            batch = {k: v.to("cuda") for k, v in batch.items()}
+            with torch.no_grad():
+                outputs = llm_model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    output_hidden_states=True,
+                )
+                shift_logits = outputs.logits[..., :-1, :].contiguous()
+                shift_labels = batch["labels"][..., 1:].contiguous()
+                lm_loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                )
+                hidden_states = torch.stack(outputs.hidden_states, dim=1)
+                aggregated = layer_aggregator(hidden_states)
+                hallu_logits = mlp(aggregated).squeeze(-1)
+                hallu_labels = batch[head_name]
+                mask = hallu_labels >= -0.1
+                if mask.any():
+                    hallu_loss = F.binary_cross_entropy_with_logits(
+                        hallu_logits[mask], hallu_labels[mask],
+                        pos_weight=pos_weight_tensor,
+                    )
+                else:
+                    hallu_loss = torch.tensor(0.0, device="cuda")
+                probs = torch.sigmoid(hallu_logits[mask]).cpu().numpy()
+                labels_np = hallu_labels[mask].cpu().numpy()
+                all_probs.extend(probs.tolist())
+                all_labels.extend(labels_np.tolist())
+                total_lm_loss += lm_loss.item()
+                total_hallu_loss += hallu_loss.item()
+                num_batches += 1
+            del outputs, aggregated, hallu_logits, hallu_labels
+            torch.cuda.empty_cache()
+
+        all_probs_np = np.array(all_probs)
+        all_labels_np = np.array(all_labels, dtype=int)
+        total_roc_auc = roc_auc_score(all_labels_np, all_probs_np)
+        total_pr_auc = average_precision_score(all_labels_np, all_probs_np)
+        fpr, tpr, thresholds = roc_curve(all_labels_np, all_probs_np)
+        best_threshold = thresholds[np.argmax(tpr - fpr)]
+
+        return {
+            "loss": (total_lm_loss + total_hallu_loss) / max(num_batches, 1),
+            "roc_auc": float(total_roc_auc),
+            "pr_auc": float(total_pr_auc),
+            "best_threshold": float(best_threshold),
+        }
+
+    training_loss_history = pd.Series()
+    eval_loss_history = pd.Series()
+    eval_auroc_history = pd.Series()
+    eval_auprc_history = pd.Series()
+
+    print("Pre-Training Evaluation (MLP mode)")
+    eval_res = eval_mlp()
+    print("evaluation:", eval_res)
+    eval_loss_history[0] = eval_res["loss"]
+    eval_auroc_history[0] = eval_res["roc_auc"]
+    eval_auprc_history[0] = eval_res["pr_auc"]
+
+    for epoch in range(EPOCHS):
+        llm_model.train()
+        layer_aggregator.train()
+        mlp.train()
+
+        total_loss_epoch = 0.0
+        optimizer.zero_grad()
+
+        progress = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        for bi, batch in enumerate(progress):
+            batch = {k: v.to("cuda") for k, v in batch.items()}
+
+            outputs = llm_model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                output_hidden_states=True,
+            )
+            shift_logits = outputs.logits[..., :-1, :].contiguous()
+            shift_labels = batch["labels"][..., 1:].contiguous()
+            lm_loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+            hidden_states = torch.stack(outputs.hidden_states, dim=1)
+            aggregated = layer_aggregator(hidden_states)
+            hallu_logits = mlp(aggregated).squeeze(-1)
+            hallu_labels = batch[head_name]
+            mask = hallu_labels >= -0.1
+            if mask.any():
+                hallu_loss = F.binary_cross_entropy_with_logits(
+                    hallu_logits[mask], hallu_labels[mask],
+                    pos_weight=pos_weight_tensor,
+                )
+            else:
+                hallu_loss = torch.tensor(0.0, device="cuda")
+
+            loss = (lm_loss + hallu_loss) / SCALE_FACTOR
+            loss.backward()
+            total_loss_epoch += loss.item() * SCALE_FACTOR
+
+            if (bi + 1) % GRAD_ACCUM == 0 or (bi + 1) == len(train_loader):
+                optimizer.step()
+                optimizer.zero_grad()
+
+            progress.set_postfix({"loss": f"{loss.item() * SCALE_FACTOR:.4f}"})
+            del outputs, hidden_states, aggregated, hallu_logits, hallu_labels
+
+        torch.cuda.empty_cache()
+        avg_loss = total_loss_epoch / len(train_loader)
+        training_loss_history[epoch + 1] = avg_loss
+        print(f"Epoch {epoch+1} training loss: {avg_loss:.4f}")
+
+        eval_res = eval_mlp()
+        print("evaluation:", eval_res)
+        eval_loss_history[epoch + 1] = eval_res["loss"]
+        eval_auroc_history[epoch + 1] = eval_res["roc_auc"]
+        eval_auprc_history[epoch + 1] = eval_res["pr_auc"]
+
+        save_dir = os.path.join(OUTPUT_DIR, f"checkpoint_{epoch+1}")
+        os.makedirs(save_dir, exist_ok=True)
+        print("Saving to", save_dir)
+
+        llm_model.save_pretrained(save_dir)
+        torch.save(mlp.state_dict(), os.path.join(save_dir, "mlp_state.pt"))
+        torch.save(layer_aggregator.state_dict(), os.path.join(save_dir, "mlp_layer_weights.pt"))
+        with open(os.path.join(save_dir, "mlp_config.json"), "w") as f:
+            json.dump(mlp.config, f, ensure_ascii=False, indent=4)
+        with open(os.path.join(save_dir, "mlp_other_data.json"), "w") as f:
+            json.dump({
+                "original_repo_id": MODEL_NAME,
+                "binarization_threshold": eval_res["best_threshold"],
+            }, f, ensure_ascii=False, indent=4)
+
+    test_res = eval_mlp(is_val=False)
+    print("test:", test_res)
+
+    print("training_loss_history")
+    print(training_loss_history)
+    print("eval_loss_history")
+    print(eval_loss_history)
+    print("eval_auroc_history")
+    print(eval_auroc_history)
+    print("eval_auprc_history")
+    print(eval_auprc_history)
+
+    plot_dir = os.path.join(OUTPUT_DIR, "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    with open(os.path.join(plot_dir, "metrics.json"), "w") as file:
+        json.dump({
+            "training_loss_history": training_loss_history.to_dict(),
+            "eval_loss_history": eval_loss_history.to_dict(),
+            "eval_auroc_history": eval_auroc_history.to_dict(),
+            "eval_auprc_history": eval_auprc_history.to_dict(),
+            "test": test_res,
+        }, file, ensure_ascii=False, indent=4)
+
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+    ax1.plot(training_loss_history.index, training_loss_history.values, label='Training Loss', color='blue')
+    ax1.plot(eval_loss_history.index, eval_loss_history.values, label='Eval Loss', color='orange')
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss")
+    ax1.tick_params(axis='y')
+    ax2 = ax1.twinx()
+    ax2.plot(eval_auroc_history.index, eval_auroc_history.values, label='Eval AUROC', color='green')
+    ax2.plot(eval_auroc_history.index, eval_auprc_history.values, label='Eval AUPRC', color='red')
+    ax2.set_ylabel("AUROC / AUPRC")
+    ax2.tick_params(axis='y')
+    plt.title("Training & Evaluation Loss and Evaluation AUROC / AUPRC Over Epochs")
+    fig.tight_layout()
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax2.legend(lines1 + lines2, labels1 + labels2, loc='best')
+    ax1.grid(True)
+    plt.savefig(os.path.join(plot_dir, "loss_and_aucs.svg"), format='svg')
+    plt.close()
+
+    import sys
+    sys.exit(0)
+
+from transformer_heads.util.helpers import DataCollatorWithPadding, get_model_params
+from transformer_heads import create_headed_qlora
+from transformer_heads.config import HeadConfig
+from transformer_heads.util.model import print_trainable_parameters
+from transformer_heads.output import HeadedModelOutput
+from transformer_heads.constants import model_type_map, loss_fct_map
+from transformers import Lfm2Model, Qwen3Model, GraniteMoeHybridModel, Gemma3TextModel
+
+model_type_map["qwen3"] = ("model", Qwen3Model)
+model_type_map["lfm2"] = ("model", Lfm2Model)
+model_type_map["granitemoehybrid"] = ("model", GraniteMoeHybridModel)
+model_type_map["gemma3_text"] = ("model", Gemma3TextModel)
+
+model_params = get_model_params(MODEL_NAME)
+model_class = model_params["model_class"]
+hidden_size = model_params["hidden_size"]
+vocab_size = model_params["vocab_size"]
+
+head_perc = 0.5
+layer_hook = int(model_params["num_hidden_layers"] * head_perc)
+if HEAD_AT_END:
+    layer_hook = 1
 
 class Masked_BCEWithLogitsLoss(torch.nn.BCEWithLogitsLoss):
     def forward(self, input: torch.Tensor, target: torch.Tensor):
